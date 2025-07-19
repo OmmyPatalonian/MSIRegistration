@@ -46,6 +46,126 @@ library(DT)
 # Source the plotting module
 source("plot_Card_overlay_NEW (3).R")
 
+# Function to extract MSI metadata and spatial information
+extract_msi_metadata <- function(msi_data) {
+  metadata_info <- list()
+  
+  tryCatch({
+    # Basic information
+    metadata_info$class <- class(msi_data)[1]
+    metadata_info$dimensions <- paste(dim(msi_data), collapse = " x ")
+    metadata_info$n_features <- nrow(msi_data)
+    metadata_info$n_pixels <- ncol(msi_data)
+    
+    # Try to get pixel coordinates and calculate resolution
+    if (exists("coord", where = msi_data) || "coord" %in% slotNames(msi_data)) {
+      coords <- tryCatch(coord(msi_data), error = function(e) NULL)
+      if (!is.null(coords)) {
+        # Calculate pixel spacing in x and y directions
+        unique_x <- sort(unique(coords$x))
+        unique_y <- sort(unique(coords$y))
+        
+        if (length(unique_x) > 1) {
+          x_spacing <- median(diff(unique_x), na.rm = TRUE)
+          metadata_info$x_spacing <- x_spacing
+        }
+        if (length(unique_y) > 1) {
+          y_spacing <- median(diff(unique_y), na.rm = TRUE)
+          metadata_info$y_spacing <- y_spacing
+        }
+        
+        metadata_info$x_range <- paste(range(coords$x), collapse = " to ")
+        metadata_info$y_range <- paste(range(coords$y), collapse = " to ")
+        metadata_info$spatial_dims <- paste(length(unique_x), "x", length(unique_y))
+      }
+    }
+    
+    # Try to get m/z information
+    if (exists("mz", where = msi_data) || "mz" %in% slotNames(msi_data)) {
+      mz_values <- tryCatch(mz(msi_data), error = function(e) NULL)
+      if (!is.null(mz_values)) {
+        metadata_info$mz_range <- paste(round(range(mz_values), 4), collapse = " to ")
+        metadata_info$n_mz_values <- length(mz_values)
+      }
+    }
+    
+    # Try to extract pixel size from metadata if available
+    if (exists("metadata", where = msi_data) || "metadata" %in% slotNames(msi_data)) {
+      meta <- tryCatch(metadata(msi_data), error = function(e) NULL)
+      if (!is.null(meta)) {
+        # Look for common spatial resolution fields
+        pixel_fields <- grep("pixel|spacing|resolution|size", names(meta), ignore.case = TRUE, value = TRUE)
+        if (length(pixel_fields) > 0) {
+          metadata_info$pixel_metadata <- meta[pixel_fields]
+        }
+      }
+    }
+    
+    # Try to get run information
+    if (exists("run", where = msi_data) || "run" %in% slotNames(msi_data)) {
+      runs <- tryCatch(run(msi_data), error = function(e) NULL)
+      if (!is.null(runs)) {
+        metadata_info$n_runs <- length(unique(runs))
+        metadata_info$runs <- paste(unique(runs), collapse = ", ")
+      }
+    }
+    
+  }, error = function(e) {
+    metadata_info$error <- paste("Error extracting metadata:", e$message)
+  })
+  
+  return(metadata_info)
+}
+
+# Function to estimate MSI pixel resolution from Cardinal data
+estimate_msi_resolution <- function(msi_data) {
+  resolution_estimate <- NULL
+  
+  tryCatch({
+    # Try to get pixel coordinates
+    coords <- coord(msi_data)
+    
+    if (!is.null(coords) && nrow(coords) > 1) {
+      # Calculate median spacing between adjacent pixels
+      unique_x <- sort(unique(coords$x))
+      unique_y <- sort(unique(coords$y))
+      
+      x_spacing <- NA
+      y_spacing <- NA
+      
+      if (length(unique_x) > 1) {
+        x_spacing <- median(diff(unique_x), na.rm = TRUE)
+      }
+      if (length(unique_y) > 1) {
+        y_spacing <- median(diff(unique_y), na.rm = TRUE)
+      }
+      
+      # Use average spacing as pixel resolution estimate
+      if (!is.na(x_spacing) && !is.na(y_spacing)) {
+        resolution_estimate <- mean(c(x_spacing, y_spacing), na.rm = TRUE)
+      } else if (!is.na(x_spacing)) {
+        resolution_estimate <- x_spacing
+      } else if (!is.na(y_spacing)) {
+        resolution_estimate <- y_spacing
+      }
+      
+      # For typical DESI data, convert to micrometers if needed
+      # (This is an assumption - may need adjustment based on actual data units)
+      if (!is.null(resolution_estimate) && resolution_estimate < 1) {
+        # Likely in mm, convert to micrometers
+        resolution_estimate <- resolution_estimate * 1000
+      } else if (!is.null(resolution_estimate) && resolution_estimate > 1000) {
+        # Likely already in micrometers, keep as is
+        resolution_estimate <- resolution_estimate
+      }
+    }
+  }, error = function(e) {
+    cat("Could not estimate MSI resolution:", e$message, "\n")
+  })
+  
+  return(resolution_estimate)
+}
+
 # Function to generate sample data for testing
 generate_sample_data <- function() {
   cat("Generating sample data for testing...\n")
@@ -149,8 +269,52 @@ ui <- fluidPage(
       fileInput("load_button", "Load Settings", accept = c(".rds")),
       actionButton("restore_settings", "Restore Settings"),
       
+      # MSI Metadata Display
+      h4("MSI Data Information"),
+      wellPanel(
+        h5("MSI Dataset Metadata"),
+        div(id = "msi_metadata", style = "font-size: 12px; background-color: #f8f9fa; padding: 10px; border-radius: 5px;",
+            verbatimTextOutput("msi_metadata_display")
+        ),
+        br(),
+        fluidRow(
+          column(6, textOutput("msi_pixel_info")),
+          column(6, textOutput("msi_spatial_info"))
+        )
+      ),
+      
+      # Resolution and scaling controls
+      h4("Resolution & Scaling"),
+      wellPanel(
+        h5("QuPath Resolution Settings"),
+        fluidRow(
+          column(6, numericInput("histology_pixel_width", "Histology Width (pixels)", 
+                               value = 1024, min = 100, max = 10000, step = 1)),
+          column(6, numericInput("histology_pixel_height", "Histology Height (pixels)", 
+                               value = 1024, min = 100, max = 10000, step = 1))
+        ),
+        fluidRow(
+          column(6, numericInput("histology_microns_per_pixel", "Histology μm/pixel", 
+                               value = 0.5, min = 0.01, max = 100, step = 0.01)),
+          column(6, numericInput("msi_microns_per_pixel", "MSI μm/pixel", 
+                               value = 20, min = 0.1, max = 1000, step = 0.1))
+        ),
+        fluidRow(
+          column(12, 
+            checkboxInput("auto_scale_resolution", "Auto-scale based on resolution difference", value = TRUE)
+          )
+        ),
+        fluidRow(
+          column(12,
+            div(id = "resolution_info", style = "font-size: 12px; color: #666;",
+                textOutput("resolution_display")
+            )
+          )
+        )
+      ),
+      
       # Image transformation controls
-      h4("Image Transformations"),
+      h4("Manual Transformations"),
       
       # Scaling controls
       fluidRow(
@@ -219,6 +383,9 @@ server <- function(input, output, session) {
   # Create a reactiveValues object for all inputs
   allInputs <- reactiveValues()
   
+  # Reactive value to store MSI data for metadata extraction
+  msi_data_reactive <- reactiveVal(NULL)
+  
   # Reactive values for settings
   settings <- reactiveValues(
     scalex = 1,
@@ -258,6 +425,18 @@ server <- function(input, output, session) {
         cat("Attempting to load MSI data from:", msi_paths[rds_idx], "\n")
         dat_in <- readRDS(msi_paths[rds_idx])
         cat("MSI data loaded successfully. Class:", class(dat_in), "\n")
+        
+        # Store MSI data for metadata extraction
+        msi_data_reactive(dat_in)
+        
+        # Try to estimate and update MSI resolution
+        estimated_resolution <- estimate_msi_resolution(dat_in)
+        if (!is.null(estimated_resolution) && !is.na(estimated_resolution)) {
+          updateNumericInput(session, "msi_microns_per_pixel", value = round(estimated_resolution, 2))
+          showNotification(paste("Auto-detected MSI resolution:", round(estimated_resolution, 2), "μm/pixel"), 
+                          type = "message")
+        }
+        
         plot_card_server("hist_plot_card", dat_in, 
                          spatialOnly = input$spatial, 
                          allInputs = allInputs)
@@ -301,6 +480,17 @@ server <- function(input, output, session) {
         cat("Number of features:", nrow(dat_in), "\n")
         cat("Number of pixels:", ncol(dat_in), "\n")
         
+        # Store MSI data for metadata extraction
+        msi_data_reactive(dat_in)
+        
+        # Try to estimate and update MSI resolution
+        estimated_resolution <- estimate_msi_resolution(dat_in)
+        if (!is.null(estimated_resolution) && !is.na(estimated_resolution)) {
+          updateNumericInput(session, "msi_microns_per_pixel", value = round(estimated_resolution, 2))
+          showNotification(paste("Auto-detected MSI resolution:", round(estimated_resolution, 2), "μm/pixel"), 
+                          type = "message")
+        }
+        
         # Try to call the plotting server with error handling
         tryCatch({
           plot_card_server("hist_plot_card", dat_in, 
@@ -343,6 +533,171 @@ server <- function(input, output, session) {
     }
   })
 
+  # MSI Metadata outputs
+  output$msi_metadata_display <- renderText({
+    msi_data <- msi_data_reactive()
+    if (is.null(msi_data)) {
+      return("No MSI data loaded yet. Please upload an MSI dataset.")
+    }
+    
+    metadata <- extract_msi_metadata(msi_data)
+    
+    # Format metadata for display
+    metadata_text <- c()
+    
+    if (!is.null(metadata$class)) {
+      metadata_text <- c(metadata_text, paste("Data Type:", metadata$class))
+    }
+    if (!is.null(metadata$dimensions)) {
+      metadata_text <- c(metadata_text, paste("Dimensions:", metadata$dimensions))
+    }
+    if (!is.null(metadata$n_features)) {
+      metadata_text <- c(metadata_text, paste("Number of m/z features:", metadata$n_features))
+    }
+    if (!is.null(metadata$n_pixels)) {
+      metadata_text <- c(metadata_text, paste("Number of pixels:", metadata$n_pixels))
+    }
+    if (!is.null(metadata$mz_range)) {
+      metadata_text <- c(metadata_text, paste("m/z range:", metadata$mz_range))
+    }
+    if (!is.null(metadata$spatial_dims)) {
+      metadata_text <- c(metadata_text, paste("Spatial dimensions:", metadata$spatial_dims))
+    }
+    if (!is.null(metadata$x_range)) {
+      metadata_text <- c(metadata_text, paste("X coordinate range:", metadata$x_range))
+    }
+    if (!is.null(metadata$y_range)) {
+      metadata_text <- c(metadata_text, paste("Y coordinate range:", metadata$y_range))
+    }
+    if (!is.null(metadata$x_spacing)) {
+      metadata_text <- c(metadata_text, paste("X pixel spacing:", round(metadata$x_spacing, 4)))
+    }
+    if (!is.null(metadata$y_spacing)) {
+      metadata_text <- c(metadata_text, paste("Y pixel spacing:", round(metadata$y_spacing, 4)))
+    }
+    if (!is.null(metadata$n_runs)) {
+      metadata_text <- c(metadata_text, paste("Number of runs:", metadata$n_runs))
+    }
+    if (!is.null(metadata$pixel_metadata)) {
+      metadata_text <- c(metadata_text, "--- Pixel Metadata ---")
+      for (i in seq_along(metadata$pixel_metadata)) {
+        metadata_text <- c(metadata_text, paste(names(metadata$pixel_metadata)[i], ":", metadata$pixel_metadata[[i]]))
+      }
+    }
+    if (!is.null(metadata$error)) {
+      metadata_text <- c(metadata_text, paste("ERROR:", metadata$error))
+    }
+    
+    if (length(metadata_text) == 0) {
+      return("Metadata extraction completed but no information found.")
+    }
+    
+    return(paste(metadata_text, collapse = "\n"))
+  })
+  
+  output$msi_pixel_info <- renderText({
+    msi_data <- msi_data_reactive()
+    if (is.null(msi_data)) {
+      return("MSI Pixel Info: Not available")
+    }
+    
+    metadata <- extract_msi_metadata(msi_data)
+    info_parts <- c()
+    
+    if (!is.null(metadata$n_pixels)) {
+      info_parts <- c(info_parts, paste("Pixels:", metadata$n_pixels))
+    }
+    if (!is.null(metadata$spatial_dims)) {
+      info_parts <- c(info_parts, paste("Grid:", metadata$spatial_dims))
+    }
+    
+    if (length(info_parts) > 0) {
+      return(paste("MSI Info:", paste(info_parts, collapse = ", ")))
+    } else {
+      return("MSI Pixel Info: Not available")
+    }
+  })
+  
+  output$msi_spatial_info <- renderText({
+    msi_data <- msi_data_reactive()
+    if (is.null(msi_data)) {
+      return("Spatial Resolution: Not available")
+    }
+    
+    estimated_res <- estimate_msi_resolution(msi_data)
+    if (!is.null(estimated_res) && !is.na(estimated_res)) {
+      return(paste("Estimated Resolution:", round(estimated_res, 2), "μm/pixel"))
+    } else {
+      return("Spatial Resolution: Could not estimate")
+    }
+  })
+
+  # Resolution calculation and display
+  output$resolution_display <- renderText({
+    req(input$histology_microns_per_pixel, input$msi_microns_per_pixel)
+    
+    resolution_ratio <- input$msi_microns_per_pixel / input$histology_microns_per_pixel
+    histology_field_width <- input$histology_pixel_width * input$histology_microns_per_pixel
+    histology_field_height <- input$histology_pixel_height * input$histology_microns_per_pixel
+    
+    paste0("Resolution ratio (MSI:Histology): ", round(resolution_ratio, 2), 
+           " | Histology field size: ", round(histology_field_width), "×", 
+           round(histology_field_height), " μm")
+  })
+  
+  # Auto-scale based on resolution when enabled
+  observe({
+    req(input$auto_scale_resolution)
+    req(input$histology_microns_per_pixel, input$msi_microns_per_pixel)
+    
+    if (input$auto_scale_resolution) {
+      # Calculate the resolution ratio
+      resolution_ratio <- input$msi_microns_per_pixel / input$histology_microns_per_pixel
+      
+      # Update the scale sliders based on resolution ratio
+      new_scale <- 1 / resolution_ratio  # Invert ratio for proper scaling
+      
+      # Constrain to slider limits
+      new_scale <- max(0.1, min(5, new_scale))
+      
+      updateSliderInput(session, "scalex", value = new_scale)
+      updateSliderInput(session, "scaley", value = new_scale)
+    }
+  })
+  
+  # Update histology dimensions when image is uploaded
+  observe({
+    req(input$histology_upload)
+    
+    tryCatch({
+      # Try to read image dimensions
+      img_path <- input$histology_upload$datapath
+      file_type <- tools::file_ext(img_path)
+      
+      if (file_type %in% c("png", "PNG")) {
+        img <- png::readPNG(img_path)
+        img_dims <- dim(img)
+        updateNumericInput(session, "histology_pixel_width", value = img_dims[2])
+        updateNumericInput(session, "histology_pixel_height", value = img_dims[1])
+        
+        showNotification(paste("Auto-detected histology dimensions:", 
+                              img_dims[2], "×", img_dims[1], "pixels"), 
+                        type = "message")
+      } else if (file_type %in% c("jpg", "jpeg", "JPG", "JPEG")) {
+        img <- jpeg::readJPEG(img_path)
+        img_dims <- dim(img)
+        updateNumericInput(session, "histology_pixel_width", value = img_dims[2])
+        updateNumericInput(session, "histology_pixel_height", value = img_dims[1])
+        
+        showNotification(paste("Auto-detected histology dimensions:", 
+                              img_dims[2], "×", img_dims[1], "pixels"), 
+                        type = "message")
+      }
+    }, error = function(e) {
+      cat("Could not auto-detect image dimensions:", e$message, "\n")
+    })
+  })
+
   # Save settings download handler
   output$save_button <- downloadHandler(
     filename = function() {
@@ -355,7 +710,12 @@ server <- function(input, output, session) {
         rotate = input$rotate,
         translate_x = input$translate_x,
         translate_y = input$translate_y,
-        alpha = input$alpha
+        alpha = input$alpha,
+        histology_pixel_width = input$histology_pixel_width,
+        histology_pixel_height = input$histology_pixel_height,
+        histology_microns_per_pixel = input$histology_microns_per_pixel,
+        msi_microns_per_pixel = input$msi_microns_per_pixel,
+        auto_scale_resolution = input$auto_scale_resolution
       )
       saveRDS(settings_to_save, file)
     }
@@ -377,13 +737,30 @@ server <- function(input, output, session) {
     loaded_settings <- settings_to_load()
     req(loaded_settings)
     
-    # Update slider inputs with loaded values
+    # Update transformation inputs with loaded values
     updateSliderInput(session, "scalex", value = loaded_settings$scalex)
     updateSliderInput(session, "scaley", value = loaded_settings$scaley)
-    updateSliderInput(session, "rotate", value = loaded_settings$rotate)
+    updateNumericInput(session, "rotate", value = loaded_settings$rotate)
     updateSliderInput(session, "translate_x", value = loaded_settings$translate_x)
     updateSliderInput(session, "translate_y", value = loaded_settings$translate_y)
     updateSliderInput(session, "alpha", value = loaded_settings$alpha)
+    
+    # Update resolution inputs if they exist in saved settings
+    if (!is.null(loaded_settings$histology_pixel_width)) {
+      updateNumericInput(session, "histology_pixel_width", value = loaded_settings$histology_pixel_width)
+    }
+    if (!is.null(loaded_settings$histology_pixel_height)) {
+      updateNumericInput(session, "histology_pixel_height", value = loaded_settings$histology_pixel_height)
+    }
+    if (!is.null(loaded_settings$histology_microns_per_pixel)) {
+      updateNumericInput(session, "histology_microns_per_pixel", value = loaded_settings$histology_microns_per_pixel)
+    }
+    if (!is.null(loaded_settings$msi_microns_per_pixel)) {
+      updateNumericInput(session, "msi_microns_per_pixel", value = loaded_settings$msi_microns_per_pixel)
+    }
+    if (!is.null(loaded_settings$auto_scale_resolution)) {
+      updateCheckboxInput(session, "auto_scale_resolution", value = loaded_settings$auto_scale_resolution)
+    }
     
     showNotification("Settings restored successfully!", type = "message")
   })
