@@ -149,16 +149,56 @@ ui <- fluidPage(
       fileInput("load_button", "Load Settings", accept = c(".rds")),
       actionButton("restore_settings", "Restore Settings"),
       
-      # Image transformation sliders
-      sliderInput("scalex", "Scale Image in X", 
-                  min = 0.1, max = 5, value = 1, step = 0.001),
-      sliderInput("scaley", "Scale Image in Y", 
-                  min = 0.1, max = 5, value = 1, step = 0.001),
-      sliderInput("rotate", "Rotate Image (degrees)", 
-                  min = -180, max = 180, value = 0, step = 0.1),
-      sliderInput("translate_x", "Translate Image X", 
+      # Image transformation controls
+      h4("Image Transformations"),
+      
+      # Scaling controls
+      fluidRow(
+        column(6, sliderInput("scalex", "Scale X", 
+                            min = 0.1, max = 5, value = 1, step = 0.001)),
+        column(6, sliderInput("scaley", "Scale Y", 
+                            min = 0.1, max = 5, value = 1, step = 0.001))
+      ),
+      
+      # Rotation controls with buttons
+      h5("Rotation"),
+      fluidRow(
+        column(3, actionButton("rotate_left", "↺ -5°", class = "btn-primary btn-sm")),
+        column(3, actionButton("rotate_right", "↻ +5°", class = "btn-primary btn-sm")),
+        column(6, numericInput("rotate", "Degrees:", value = 0, min = -180, max = 180, step = 0.1))
+      ),
+      fluidRow(
+        column(6, actionButton("rotate_left_fine", "↺ -1°", class = "btn-outline-primary btn-sm")),
+        column(6, actionButton("rotate_right_fine", "↻ +1°", class = "btn-outline-primary btn-sm"))
+      ),
+      
+      # Translation controls with arrow buttons
+      h5("Translation"),
+      fluidRow(
+        column(12, 
+          div(style = "text-align: center; margin: 10px 0;",
+            actionButton("move_up", "▲", class = "btn-success btn-sm", style = "display: block; margin: 0 auto; width: 40px;")
+          )
+        )
+      ),
+      fluidRow(
+        column(4, actionButton("move_left", "◀", class = "btn-success btn-sm", style = "width: 40px;")),
+        column(4, div(style = "text-align: center;", actionButton("center_image", "⌂", class = "btn-warning btn-sm", style = "width: 40px;"))),
+        column(4, actionButton("move_right", "▶", class = "btn-success btn-sm", style = "width: 40px;"))
+      ),
+      fluidRow(
+        column(12, 
+          div(style = "text-align: center; margin: 10px 0;",
+            actionButton("move_down", "▼", class = "btn-success btn-sm", style = "display: block; margin: 0 auto; width: 40px;")
+          )
+        )
+      ),
+      
+      # Fine control sliders (for precise adjustments)
+      h5("Fine Controls"),
+      sliderInput("translate_x", "Fine X Position", 
                   min = -100, max = 100, value = 0, step = 0.1),
-      sliderInput("translate_y", "Translate Image Y", 
+      sliderInput("translate_y", "Fine Y Position", 
                   min = -100, max = 100, value = 0, step = 0.1),
       
       # Display options
@@ -346,6 +386,67 @@ server <- function(input, output, session) {
     updateSliderInput(session, "alpha", value = loaded_settings$alpha)
     
     showNotification("Settings restored successfully!", type = "message")
+  })
+  
+  # Movement step sizes
+  move_step_large <- 5  # pixels for arrow buttons
+  move_step_small <- 1  # pixels for small adjustments
+  
+  # Translation button event handlers
+  observeEvent(input$move_up, {
+    new_value <- input$translate_y + move_step_large
+    new_value <- max(-100, min(100, new_value))  # Keep within bounds
+    updateSliderInput(session, "translate_y", value = new_value)
+  })
+  
+  observeEvent(input$move_down, {
+    new_value <- input$translate_y - move_step_large
+    new_value <- max(-100, min(100, new_value))  # Keep within bounds
+    updateSliderInput(session, "translate_y", value = new_value)
+  })
+  
+  observeEvent(input$move_left, {
+    new_value <- input$translate_x - move_step_large
+    new_value <- max(-100, min(100, new_value))  # Keep within bounds
+    updateSliderInput(session, "translate_x", value = new_value)
+  })
+  
+  observeEvent(input$move_right, {
+    new_value <- input$translate_x + move_step_large
+    new_value <- max(-100, min(100, new_value))  # Keep within bounds
+    updateSliderInput(session, "translate_x", value = new_value)
+  })
+  
+  # Center button - reset translation to zero
+  observeEvent(input$center_image, {
+    updateSliderInput(session, "translate_x", value = 0)
+    updateSliderInput(session, "translate_y", value = 0)
+    showNotification("Image centered", type = "message")
+  })
+  
+  # Rotation button event handlers
+  observeEvent(input$rotate_left, {
+    new_value <- input$rotate - 5
+    new_value <- max(-180, min(180, new_value))  # Keep within bounds
+    updateNumericInput(session, "rotate", value = new_value)
+  })
+  
+  observeEvent(input$rotate_right, {
+    new_value <- input$rotate + 5
+    new_value <- max(-180, min(180, new_value))  # Keep within bounds
+    updateNumericInput(session, "rotate", value = new_value)
+  })
+  
+  observeEvent(input$rotate_left_fine, {
+    new_value <- input$rotate - 1
+    new_value <- max(-180, min(180, new_value))  # Keep within bounds
+    updateNumericInput(session, "rotate", value = new_value)
+  })
+  
+  observeEvent(input$rotate_right_fine, {
+    new_value <- input$rotate + 1
+    new_value <- max(-180, min(180, new_value))  # Keep within bounds
+    updateNumericInput(session, "rotate", value = new_value)
   })
 }
 
