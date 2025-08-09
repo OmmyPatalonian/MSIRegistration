@@ -226,7 +226,26 @@ generate_sample_data <- function() {
 # Uncomment the line below to generate sample data when sourcing this file
 # generate_sample_data()
 
-# Set maximum file size for uploads (500MB)
+# Function to get MSI dimensions in pixels
+get_msi_dimensions <- function(msi_data) {
+  dims <- list(width = NULL, height = NULL)
+  
+  tryCatch({
+    coords <- coord(msi_data)
+    if (!is.null(coords) && nrow(coords) > 0) {
+      unique_x <- unique(coords$x)
+      unique_y <- unique(coords$y)
+      dims$width <- length(unique_x)
+      dims$height <- length(unique_y)
+    }
+  }, error = function(e) {
+    cat("Error getting MSI dimensions:", e$message, "\n")
+  })
+  
+  return(dims)
+}
+
+  # Set maximum file size for uploads (500MB)
 options(shiny.maxRequestSize = 500*1024^2)
 
 ui <- fluidPage(
@@ -286,12 +305,18 @@ ui <- fluidPage(
       # Resolution and scaling controls
       h4("Resolution & Scaling"),
       wellPanel(
-        h5("QuPath Resolution Settings"),
+        h5("Resolution Settings"),
         fluidRow(
           column(6, numericInput("histology_pixel_width", "Histology Width (pixels)", 
                                value = 1024, min = 100, max = 10000, step = 1)),
           column(6, numericInput("histology_pixel_height", "Histology Height (pixels)", 
                                value = 1024, min = 100, max = 10000, step = 1))
+        ),
+        fluidRow(
+          column(6, numericInput("msi_pixel_width", "MSI Width (pixels)", 
+                              value = 20, min = 1, max = 1000, step = 1)),
+          column(6, numericInput("msi_pixel_height", "MSI Height (pixels)", 
+                              value = 20, min = 1, max = 1000, step = 1))
         ),
         fluidRow(
           column(6, numericInput("histology_microns_per_pixel", "Histology μm/pixel", 
@@ -300,14 +325,26 @@ ui <- fluidPage(
                                value = 20, min = 0.1, max = 1000, step = 0.1))
         ),
         fluidRow(
-          column(12, 
-            checkboxInput("auto_scale_resolution", "Auto-scale based on resolution difference", value = TRUE)
+          column(6, 
+            checkboxInput("auto_scale_resolution", "Auto-scale based on resolution", value = TRUE)
+          ),
+          column(6,
+            selectInput("scale_target", "Scale to target", 
+                        choices = c("MSI Grid" = "msi", "Histology Grid" = "histology", "Best Fit" = "best_fit"),
+                        selected = "best_fit")
           )
         ),
         fluidRow(
           column(12,
             div(id = "resolution_info", style = "font-size: 12px; color: #666;",
                 textOutput("resolution_display")
+            )
+          )
+        ),
+        fluidRow(
+          column(12,
+            div(id = "physical_size_info", style = "font-size: 12px; color: #666;",
+                textOutput("physical_size_display")
             )
           )
         )
@@ -367,7 +404,16 @@ ui <- fluidPage(
       
       # Display options
       checkboxInput("spatial", "Spatial plot only", value = TRUE),
-      checkboxInput("debug", "Debug plot?", value = FALSE)
+      checkboxInput("debug", "Debug plot?", value = FALSE),
+      
+      # Advanced rendering options
+      h4("Advanced Options"),
+      wellPanel(
+        selectInput("render_mode", "MSI Rendering Mode", 
+                    choices = c("Standard" = "standard", "Clean Pixels" = "clean"),
+                    selected = "standard"),
+        helpText("Clean mode may improve overlay quality but take longer to render")
+      )
     ),
     
     mainPanel(
@@ -381,7 +427,16 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   
   # Create a reactiveValues object for all inputs
-  allInputs <- reactiveValues()
+  allInputs <- reactiveValues(
+    # Add a default max scale factor to prevent memory issues with extreme resolution differences
+    max_scale_factor = 5.0,
+    # Flag to check if using sample data
+    is_sample_data = FALSE,
+    # Default values for resolution settings
+    histology_microns_per_pixel = 0.5,
+    msi_microns_per_pixel = 20,
+    scale_target = "best_fit"
+  )
   
   # Reactive value to store MSI data for metadata extraction
   msi_data_reactive <- reactiveVal(NULL)
@@ -402,6 +457,86 @@ server <- function(input, output, session) {
     for (name in names(inputList)) {
       allInputs[[name]] <- inputList[[name]]
     }
+    
+    # Ensure render_mode is available
+    if (is.null(allInputs$render_mode)) {
+      allInputs$render_mode <- "standard"
+    }
+  })
+  
+  # Make sure dimension changes get reflected immediately and trigger recalculation
+  update_dimension_scaling <- function() {
+    # Ensure all necessary values are available
+    if (is.null(input$histology_pixel_width) || is.null(input$msi_pixel_width) ||
+        is.null(input$histology_pixel_height) || is.null(input$msi_pixel_height) ||
+        is.na(input$histology_pixel_width) || is.na(input$msi_pixel_width) || 
+        is.na(input$histology_pixel_height) || is.na(input$msi_pixel_height) || 
+        input$histology_pixel_width <= 0 || input$msi_pixel_width <= 0 ||
+        input$histology_pixel_height <= 0 || input$msi_pixel_height <= 0) {
+      return()
+    }
+    
+    # Update allInputs
+    allInputs$histology_pixel_width <- input$histology_pixel_width
+    allInputs$histology_pixel_height <- input$histology_pixel_height
+    allInputs$msi_pixel_width <- input$msi_pixel_width
+    allInputs$msi_pixel_height <- input$msi_pixel_height
+    
+    # Force a plot refresh
+    allInputs$dimension_change_trigger <- runif(1)
+    
+    # Log the change
+    cat("\nDimension change detected:\n")
+    cat(" - Histology dimensions:", input$histology_pixel_width, "×", input$histology_pixel_height, "pixels\n")
+    cat(" - MSI dimensions:", input$msi_pixel_width, "×", input$msi_pixel_height, "pixels\n")
+  }
+  
+  # Observe changes to dimensions
+  observeEvent(input$histology_pixel_width, {
+    allInputs$histology_pixel_width <- input$histology_pixel_width
+    update_dimension_scaling()
+  })
+  
+  observeEvent(input$histology_pixel_height, {
+    allInputs$histology_pixel_height <- input$histology_pixel_height
+    update_dimension_scaling()
+  })
+  
+  observeEvent(input$msi_pixel_width, {
+    allInputs$msi_pixel_width <- input$msi_pixel_width
+    update_dimension_scaling()
+  })
+  
+  observeEvent(input$msi_pixel_height, {
+    allInputs$msi_pixel_height <- input$msi_pixel_height
+    update_dimension_scaling()
+  })
+  
+  # Make sure resolution values are reflected immediately
+  observeEvent(input$histology_microns_per_pixel, {
+    allInputs$histology_microns_per_pixel <- input$histology_microns_per_pixel
+    # Force plot refresh
+    allInputs$resolution_change_trigger <- runif(1)
+  }, priority = 10)
+  
+  observeEvent(input$msi_microns_per_pixel, {
+    allInputs$msi_microns_per_pixel <- input$msi_microns_per_pixel
+    # Force plot refresh
+    allInputs$resolution_change_trigger <- runif(1)
+  }, priority = 10)
+  
+  # Make sure scale target changes are reflected immediately
+  observeEvent(input$scale_target, {
+    allInputs$scale_target <- input$scale_target
+    # Force plot refresh
+    allInputs$resolution_change_trigger <- runif(1)
+  }, priority = 10)
+  
+  # Make sure render mode changes are reflected immediately
+  observeEvent(input$render_mode, {
+    allInputs$render_mode <- input$render_mode
+    # Force refresh of plot when render mode changes
+    allInputs$render_mode_change <- runif(1)
   })
   
   # Main observer for MSI data processing
@@ -429,12 +564,34 @@ server <- function(input, output, session) {
         # Store MSI data for metadata extraction
         msi_data_reactive(dat_in)
         
+        # Extract MSI width and height and update UI
+        tryCatch({
+          coords <- coord(dat_in)
+          if (!is.null(coords)) {
+            msi_width <- length(unique(coords$x))
+            msi_height <- length(unique(coords$y))
+            cat("MSI dimensions:", msi_width, "×", msi_height, "pixels\n")
+            
+            # Update UI with actual MSI dimensions
+            updateNumericInput(session, "msi_pixel_width", value = msi_width)
+            updateNumericInput(session, "msi_pixel_height", value = msi_height)
+          }
+        }, error = function(e) {
+          cat("Error extracting MSI dimensions:", e$message, "\n")
+        })
+        
         # Try to estimate and update MSI resolution
         estimated_resolution <- estimate_msi_resolution(dat_in)
         if (!is.null(estimated_resolution) && !is.na(estimated_resolution)) {
           updateNumericInput(session, "msi_microns_per_pixel", value = round(estimated_resolution, 2))
           showNotification(paste("Auto-detected MSI resolution:", round(estimated_resolution, 2), "μm/pixel"), 
                           type = "message")
+        }
+        
+        # Set sample data flag if needed
+        if (any(msi_names == "sample_msi_data.rds")) {
+          allInputs$is_sample_data <- TRUE
+          cat("Sample MSI data detected\n")
         }
         
         plot_card_server("hist_plot_card", dat_in, 
@@ -480,6 +637,19 @@ server <- function(input, output, session) {
         cat("Number of features:", nrow(dat_in), "\n")
         cat("Number of pixels:", ncol(dat_in), "\n")
         
+        # Get MSI image dimensions directly from coordinates
+        tryCatch({
+          lengthx <- length(unique(coord(dat_in)$x))
+          lengthy <- length(unique(coord(dat_in)$y))
+          cat("MSI dimensions (from coords):", lengthx, "×", lengthy, "pixels\n")
+          
+          # Update UI with actual MSI dimensions
+          updateNumericInput(session, "msi_pixel_width", value = lengthx)
+          updateNumericInput(session, "msi_pixel_height", value = lengthy)
+        }, error = function(e) {
+          cat("Could not determine MSI dimensions from coordinates:", e$message, "\n")
+        })
+        
         # Store MSI data for metadata extraction
         msi_data_reactive(dat_in)
         
@@ -489,6 +659,12 @@ server <- function(input, output, session) {
           updateNumericInput(session, "msi_microns_per_pixel", value = round(estimated_resolution, 2))
           showNotification(paste("Auto-detected MSI resolution:", round(estimated_resolution, 2), "μm/pixel"), 
                           type = "message")
+        }
+        
+        # Set sample data flag if needed
+        if (any(msi_names == "sample_msi_data.rds")) {
+          allInputs$is_sample_data <- TRUE
+          cat("Sample MSI data detected\n")
         }
         
         # Try to call the plotting server with error handling
@@ -518,6 +694,14 @@ server <- function(input, output, session) {
           "Size:", input$histology_upload$size, "bytes\n")
       showNotification(paste("Histology image uploaded:", input$histology_upload$name), 
                        type = "message")
+      
+      # Check if this is the sample data
+      if (input$histology_upload$name == "sample_histology.png") {
+        allInputs$is_sample_data <- TRUE
+        cat("Sample histology data detected\n")
+      } else {
+        allInputs$is_sample_data <- FALSE
+      }
     }
   })
   
@@ -632,6 +816,23 @@ server <- function(input, output, session) {
     }
   })
 
+  # Utility functions for micron/pixel conversion
+  phys_size_um <- function(dims_px, scale_um_per_px) {
+    dims_px * scale_um_per_px
+  }
+  
+  resampled_dims <- function(dims_px, source_um_per_px, target_um_per_px) {
+    round(dims_px * (source_um_per_px / target_um_per_px))
+  }
+  
+  px_to_um <- function(xy_px, scale_um_per_px) {
+    xy_px * scale_um_per_px
+  }
+  
+  um_to_px <- function(xy_um, scale_um_per_px) {
+    xy_um / scale_um_per_px
+  }
+  
   # Resolution calculation and display
   output$resolution_display <- renderText({
     req(input$histology_microns_per_pixel, input$msi_microns_per_pixel)
@@ -645,25 +846,167 @@ server <- function(input, output, session) {
            round(histology_field_height), " μm")
   })
   
-  # Auto-scale based on resolution when enabled
-  observe({
-    req(input$auto_scale_resolution)
+  # Physical size display
+  output$physical_size_display <- renderText({
     req(input$histology_microns_per_pixel, input$msi_microns_per_pixel)
+    req(input$histology_pixel_width, input$histology_pixel_height)
     
-    if (input$auto_scale_resolution) {
-      # Calculate the resolution ratio
-      resolution_ratio <- input$msi_microns_per_pixel / input$histology_microns_per_pixel
+    # Get MSI dimensions
+    msi_data <- msi_data_reactive()
+    msi_width <- NULL
+    msi_height <- NULL
+    
+    if (!is.null(msi_data)) {
+      tryCatch({
+        coords <- coord(msi_data)
+        if (!is.null(coords)) {
+          msi_width <- length(unique(coords$x))
+          msi_height <- length(unique(coords$y))
+        }
+      }, error = function(e) {
+        cat("Error getting MSI dimensions:", e$message, "\n")
+      })
+    }
+    
+    # Calculate physical sizes
+    if (!is.null(msi_width) && !is.null(msi_height)) {
+      msi_phys_width <- msi_width * input$msi_microns_per_pixel
+      msi_phys_height <- msi_height * input$msi_microns_per_pixel
       
-      # Update the scale sliders based on resolution ratio
-      new_scale <- 1 / resolution_ratio  # Invert ratio for proper scaling
+      histo_phys_width <- input$histology_pixel_width * input$histology_microns_per_pixel
+      histo_phys_height <- input$histology_pixel_height * input$histology_microns_per_pixel
       
-      # Constrain to slider limits
-      new_scale <- max(0.1, min(5, new_scale))
+      if (input$scale_target == "msi") {
+        histo_on_msi <- resampled_dims(
+          c(input$histology_pixel_width, input$histology_pixel_height), 
+          input$histology_microns_per_pixel, 
+          input$msi_microns_per_pixel)
+        
+        return(paste0("Physical sizes - MSI: ", round(msi_phys_width, 1), "×", round(msi_phys_height, 1), " μm | ",
+                     "Histology: ", round(histo_phys_width, 1), "×", round(histo_phys_height, 1), " μm | ",
+                     "Histology on MSI grid: ", histo_on_msi[1], "×", histo_on_msi[2], " pixels"))
+      } else if (input$scale_target == "histology") {
+        msi_on_histo <- resampled_dims(
+          c(msi_width, msi_height), 
+          input$msi_microns_per_pixel, 
+          input$histology_microns_per_pixel)
+        
+        return(paste0("Physical sizes - MSI: ", round(msi_phys_width, 1), "×", round(msi_phys_height, 1), " μm | ",
+                     "Histology: ", round(histo_phys_width, 1), "×", round(histo_phys_height, 1), " μm | ",
+                     "MSI on histology grid: ", msi_on_histo[1], "×", msi_on_histo[2], " pixels"))
+      } else {
+        return(paste0("Physical sizes - MSI: ", round(msi_phys_width, 1), "×", round(msi_phys_height, 1), " μm | ",
+                     "Histology: ", round(histo_phys_width, 1), "×", round(histo_phys_height, 1), " μm"))
+      }
+    } else {
+      histo_phys_width <- input$histology_pixel_width * input$histology_microns_per_pixel
+      histo_phys_height <- input$histology_pixel_height * input$histology_microns_per_pixel
       
-      updateSliderInput(session, "scalex", value = new_scale)
-      updateSliderInput(session, "scaley", value = new_scale)
+      return(paste0("Physical size - Histology: ", round(histo_phys_width, 1), "×", round(histo_phys_height, 1), " μm | ",
+                   "MSI dimensions not available"))
     }
   })
+  
+  # Auto-scale based on resolution and dimensions when enabled
+  observeEvent(list(input$auto_scale_resolution, 
+                   input$histology_microns_per_pixel, input$msi_microns_per_pixel,
+                   input$histology_pixel_width, input$histology_pixel_height,
+                   input$msi_pixel_width, input$msi_pixel_height,
+                   input$scale_target), {
+    
+    req(input$histology_microns_per_pixel, input$msi_microns_per_pixel)
+    req(input$scale_target)
+    
+    # Update allInputs immediately with current resolution and dimension values
+    allInputs$histology_microns_per_pixel <- input$histology_microns_per_pixel
+    allInputs$msi_microns_per_pixel <- input$msi_microns_per_pixel
+    allInputs$histology_pixel_width <- input$histology_pixel_width
+    allInputs$histology_pixel_height <- input$histology_pixel_height
+    allInputs$msi_pixel_width <- input$msi_pixel_width
+    allInputs$msi_pixel_height <- input$msi_pixel_height
+    allInputs$scale_target <- input$scale_target
+    
+    # Force refresh plot when parameters change
+    allInputs$resolution_change_trigger <- runif(1)
+    
+    # Log current values for debugging
+    cat("\nAuto-scale observer triggered with values:\n")
+    cat(" - Histology dimensions:", input$histology_pixel_width, "×", input$histology_pixel_height, "pixels\n")
+    cat(" - MSI dimensions:", input$msi_pixel_width, "×", input$msi_pixel_height, "pixels\n")
+    cat(" - Histology resolution:", input$histology_microns_per_pixel, "μm/pixel\n")
+    cat(" - MSI resolution:", input$msi_microns_per_pixel, "μm/pixel\n")
+    cat(" - Scale target:", input$scale_target, "\n")
+    cat(" - Auto-scale enabled:", input$auto_scale_resolution, "\n")
+    
+    # Calculate pixel dimension scale factors
+    pixel_scale_x <- 1
+    pixel_scale_y <- 1
+    
+    # Only apply pixel dimension scaling if all values are valid
+    if (!is.null(input$histology_pixel_width) && !is.null(input$msi_pixel_width) &&
+        !is.null(input$histology_pixel_height) && !is.null(input$msi_pixel_height) &&
+        !is.na(input$histology_pixel_width) && !is.na(input$msi_pixel_width) && 
+        !is.na(input$histology_pixel_height) && !is.na(input$msi_pixel_height) && 
+        input$histology_pixel_width > 0 && input$msi_pixel_width > 0 &&
+        input$histology_pixel_height > 0 && input$msi_pixel_height > 0) {
+        
+        # Calculate pixel dimension ratios
+        pixel_scale_x <- input$msi_pixel_width / input$histology_pixel_width  # Inverted ratio from render code
+        pixel_scale_y <- input$msi_pixel_height / input$histology_pixel_height # Inverted ratio from render code
+        
+        cat("Pixel dimension scale factors (MSI:Histology) - X:", pixel_scale_x, "Y:", pixel_scale_y, "\n")
+    } else {
+        cat("Pixel dimension scaling not applied (missing or invalid dimensions)\n")
+    }
+    
+    # Update scales when auto-scale is enabled
+    if (input$auto_scale_resolution) {
+      # Determine target microns per pixel based on scale target
+      target_um_per_px <- switch(input$scale_target,
+        "msi"       = input$msi_microns_per_pixel,
+        "histology" = input$histology_microns_per_pixel,
+        "best_fit"  = sqrt(input$msi_microns_per_pixel * input$histology_microns_per_pixel)
+      )
+      
+      # Calculate resolution-based scale factors
+      scale_histology <- input$histology_microns_per_pixel / target_um_per_px
+      scale_msi <- input$msi_microns_per_pixel / target_um_per_px
+      
+      # For diagnostic purposes
+      cat("Resolution-based scaling:\n")
+      cat(" - Target µm/pixel:", target_um_per_px, "\n")
+      cat(" - Histology scale factor:", scale_histology, "\n")
+      cat(" - MSI scale factor:", scale_msi, "\n")
+      
+      # Combine resolution scaling with pixel dimension scaling
+      # We're scaling the histology image in this application
+      new_scale_x <- scale_histology * pixel_scale_x
+      new_scale_y <- scale_histology * pixel_scale_y
+      
+      cat("Combined scale factors - X:", new_scale_x, "Y:", new_scale_y, "\n")
+      
+      # Adjust for aspect ratio preservation
+      if (abs(new_scale_x - new_scale_y) < 0.1) {
+        # If scales are similar, use average to maintain aspect ratio
+        avg_scale <- (new_scale_x + new_scale_y) / 2
+        new_scale_x <- avg_scale
+        new_scale_y <- avg_scale
+        cat("Preserving aspect ratio with average scale:", avg_scale, "\n")
+      }
+      
+      # Update both scales with combined factors
+      updateSliderInput(session, "scalex", value = new_scale_x)
+      updateSliderInput(session, "scaley", value = new_scale_y)
+    } else {
+      # If auto-scale is disabled but we have valid pixel dimensions,
+      # still apply basic pixel ratio scaling
+      if (pixel_scale_x != 1 || pixel_scale_y != 1) {
+        cat("Auto-scale disabled but applying basic pixel dimension scaling\n")
+        updateSliderInput(session, "scalex", value = pixel_scale_x)
+        updateSliderInput(session, "scaley", value = pixel_scale_y)
+      }
+    }
+  }, ignoreInit = FALSE)
   
   # Update histology dimensions when image is uploaded
   observe({
@@ -672,20 +1015,27 @@ server <- function(input, output, session) {
     tryCatch({
       # Try to read image dimensions
       img_path <- input$histology_upload$datapath
-      file_type <- tools::file_ext(img_path)
+      file_type <- tolower(tools::file_ext(img_path))
       
-      if (file_type %in% c("png", "PNG")) {
+      if (file_type %in% c("png")) {
         img <- png::readPNG(img_path)
         img_dims <- dim(img)
+        # Immediately update allInputs as well to ensure these values are used
+        allInputs$histology_pixel_width <- img_dims[2]
+        allInputs$histology_pixel_height <- img_dims[1]
         updateNumericInput(session, "histology_pixel_width", value = img_dims[2])
         updateNumericInput(session, "histology_pixel_height", value = img_dims[1])
         
         showNotification(paste("Auto-detected histology dimensions:", 
                               img_dims[2], "×", img_dims[1], "pixels"), 
                         type = "message")
-      } else if (file_type %in% c("jpg", "jpeg", "JPG", "JPEG")) {
+        
+      } else if (file_type %in% c("jpg", "jpeg")) {
         img <- jpeg::readJPEG(img_path)
         img_dims <- dim(img)
+        # Immediately update allInputs as well
+        allInputs$histology_pixel_width <- img_dims[2]
+        allInputs$histology_pixel_height <- img_dims[1]
         updateNumericInput(session, "histology_pixel_width", value = img_dims[2])
         updateNumericInput(session, "histology_pixel_height", value = img_dims[1])
         
@@ -715,7 +1065,8 @@ server <- function(input, output, session) {
         histology_pixel_height = input$histology_pixel_height,
         histology_microns_per_pixel = input$histology_microns_per_pixel,
         msi_microns_per_pixel = input$msi_microns_per_pixel,
-        auto_scale_resolution = input$auto_scale_resolution
+        auto_scale_resolution = input$auto_scale_resolution,
+        scale_target = input$scale_target
       )
       saveRDS(settings_to_save, file)
     }
@@ -761,9 +1112,14 @@ server <- function(input, output, session) {
     if (!is.null(loaded_settings$auto_scale_resolution)) {
       updateCheckboxInput(session, "auto_scale_resolution", value = loaded_settings$auto_scale_resolution)
     }
+    if (!is.null(loaded_settings$scale_target)) {
+      updateSelectInput(session, "scale_target", selected = loaded_settings$scale_target)
+    }
     
     showNotification("Settings restored successfully!", type = "message")
   })
+  
+
   
   # Movement step sizes
   move_step_large <- 5  # pixels for arrow buttons

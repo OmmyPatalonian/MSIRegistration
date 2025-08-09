@@ -121,6 +121,10 @@ plot_card_UI <- function(id) {
                    column(6, numericInput(ns("width_im"), "Image plot width (px)", value = 800, step = 50)),
                    column(6, numericInput(ns("height_im"), "Image plot height (px)", value=600, step = 50))
                  ),
+                 fluidRow(
+                   column(12, sliderInput(ns("intensity_threshold"), "Noise threshold percentile", 
+                                       min = 0, max = 0.2, value = 0.05, step = 0.01))
+                 ),
                  checkboxInput(ns("plot_pdata"), "Plot Phenotype data?", value=FALSE),
                  uiOutput(ns("plotpdata")),
                  checkboxInput(ns("expand_fonts"), "Extended font options?", value=FALSE),
@@ -416,8 +420,10 @@ plot_card_UI <- function(id) {
           
           #req(overview_peaks_sel)
           
-          # Add dependency on alpha slider to trigger re-rendering
+          # Add dependency on important parameters to trigger re-rendering
           alpha_val <- allInputs$alpha
+          resolution_trigger <- allInputs$resolution_change_trigger
+          render_trigger <- allInputs$render_mode_change
           
           # A temp file to save the output.
           # This file will be removed later by renderImage
@@ -572,7 +578,127 @@ plot_card_UI <- function(id) {
               arg_list$style <- "dark"
             }
             
-            print(do.call(Cardinal::image, arg_list))
+            # Check if clean rendering mode is enabled for TIC visualization
+            if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+              # Create clean MSI image with direct data extraction for TIC
+              tryCatch({
+                cat("Using clean rendering mode for TIC visualization\n")
+                
+                # Extract grid coordinates directly
+                coords <- coord(overview_peaks_sel)
+                
+                # Apply preprocessing for cleaner visualization
+                msset_clean <- overview_peaks_sel
+                if (input$smooth3 != "none") {
+                  msset_clean <- tryCatch({
+                    Cardinal::smoothSignal(msset_clean, method = input$smooth3)
+                  }, error = function(e) {
+                    cat("Smoothing failed, using original data:", e$message, "\n")
+                    msset_clean
+                  })
+                }
+                
+                # For TIC, we want all features within the m/z range
+                tol_value <- round(plusminus, 3)
+                
+                # Subset features based on m/z range
+                sub_data <- Cardinal::subsetFeatures(msset_clean, 
+                                                    mz >= mz_set - tol_value & 
+                                                    mz <= mz_set + tol_value)
+                
+                # Calculate TIC for each pixel (sum of all intensities)
+                intensities <- Cardinal::intensity(sub_data)
+                pixel_values <- apply(intensities, 2, sum, na.rm = TRUE)
+                
+                # Remove NA and Inf values
+                pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
+                
+                # Apply contrast enhancement if selected
+                if (input$contrast3 == "histogram") {
+                  # Histogram equalization for better contrast
+                  pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
+                } else if (input$contrast3 == "adaptive") {
+                  # Simple adaptive contrast enhancement
+                  q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
+                  q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
+                  pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
+                  pixel_values[pixel_values < 0] <- 0
+                }
+                
+                # Filter low-intensity values (likely noise)
+                nonzero_vals <- pixel_values[pixel_values > 0]
+                if (length(nonzero_vals) > 0) {
+                  intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
+                  pixel_values[pixel_values < intensity_threshold] <- 0
+                  
+                  # Generate colormap with selected palette
+                  colormap <- cpal(input$color3)
+                  
+                  # Scale values to colormap range
+                  scaled_values <- pixel_values
+                  if (max(scaled_values, na.rm = TRUE) > 0) {
+                    scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
+                                     (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
+                    scaled_values[scaled_values < 0] <- 0
+                    scaled_values[scaled_values > 1] <- 1
+                  }
+                  
+                  # Map to color indices
+                  color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
+                  color_indices[color_indices < 1 | is.na(color_indices)] <- 1
+                  image_colors <- colormap[color_indices]
+                  
+                  # Set transparent color for zero values
+                  image_colors[pixel_values == 0] <- NA
+                  
+                  # Render clean MSI image
+                  plot.new()
+                  plot.window(xlim = range(coords$x, na.rm = TRUE),
+                             ylim = range(coords$y, na.rm = TRUE))
+                  
+                  # Adjust background color if needed
+                  if (input$dark_bg) {
+                    par(bg = "black")
+                  }
+                  
+                  # Plot each pixel with appropriate color and size
+                  points(coords$x, coords$y, 
+                        pch = 15, 
+                        col = image_colors,
+                        cex = 1.5)  # Adjust pixel size as needed
+                  
+                  # Add axes and title with appropriate style
+                  box()
+                  title_color <- if(input$dark_bg) "white" else "black"
+                  title(main = "Total Ion Current (TIC)", col.main = title_color)
+                  
+                  if (input$colorkey3) {
+                    # Add color key with better legend formatting
+                    n_colors <- min(10, length(unique(na.omit(image_colors))))
+                    legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
+                    legend("right", 
+                           legend = rep("", length(legend_colors)), 
+                           fill = legend_colors, 
+                           border = NA,
+                           bty = "n",
+                           text.col = title_color)
+                  }
+                  
+                  cat("Clean MSI rendering completed for TIC\n")
+                } else {
+                  cat("No non-zero intensity values found for TIC\n")
+                  # Fall back to standard rendering
+                  print(do.call(Cardinal::image, arg_list))
+                }
+              }, error = function(e) {
+                cat("Error in clean MSI rendering for TIC:", e$message, "\n")
+                # Fall back to standard rendering
+                print(do.call(Cardinal::image, arg_list))
+              })
+            } else {
+              # Standard Cardinal image rendering
+              print(do.call(Cardinal::image, arg_list))
+            }
             
             
             
@@ -744,9 +870,8 @@ plot_card_UI <- function(id) {
               smoothing_option <- if (input$smooth3 != "none")  input$smooth3 else NULL
               enhance_option <- if (input$contrast3 != "none")  input$contrast3 else NULL
               
-              
-              arg_list<-list(overview_peaks_sel,
-                             #'xic',
+              # Prepare arguments for Cardinal image
+              arg_list <- list(overview_peaks_sel,
                              mz=mz_set,
                              tolerance=round(plusminus,3), 
                              units='mz',
@@ -761,10 +886,161 @@ plot_card_UI <- function(id) {
                 arg_list$style <- "dark"
               }
               
-              
-              
-              
-              print(do.call(Cardinal::image, arg_list))
+              # Check for clean rendering mode for custom ion
+              if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+                # Use direct data extraction approach for better pixel control
+                tryCatch({
+                  # Extract grid coordinates directly from MSI data
+                  coords <- coord(overview_peaks_sel)
+                  
+                  # Identify m/z indices for selected ions
+                  mz_indices <- sapply(mz_set, function(mz_value) {
+                    which.min(abs(mz(overview_peaks_sel) - mz_value))
+                  })
+                  
+                  # Apply preprocessing for cleaner visualization
+                  msset_clean <- overview_peaks_sel
+                  if (input$smooth3 != "none") {
+                    msset_clean <- tryCatch({
+                      Cardinal::smoothSignal(msset_clean, method = input$smooth3)
+                    }, error = function(e) {
+                      cat("Smoothing failed, using original data:", e$message, "\n")
+                      msset_clean
+                    })
+                  }
+                  
+                  # Extract intensity values for each selected m/z
+                  all_intensities <- list()
+                  for (i in seq_along(mz_indices)) {
+                    idx <- mz_indices[i]
+                    # Get intensities for this m/z value with tolerance
+                    mz_value <- mz(overview_peaks_sel)[idx]
+                    sub_data <- Cardinal::subsetFeatures(msset_clean, 
+                                                        mz >= mz_value - round(plusminus, 3) & 
+                                                        mz <= mz_value + round(plusminus, 3))
+                    
+                    if (input$superpose && i > 1) {
+                      # For superposition, combine with previous intensities
+                      intensities <- all_intensities[[1]]
+                    } else {
+                      # Extract raw intensities
+                      intensities <- Cardinal::intensity(sub_data)
+                      
+                      # If multiple features, combine according to display mode
+                      if (nrow(sub_data) > 1) {
+                        intensities <- apply(intensities, 2, mean, na.rm = TRUE)
+                      } else {
+                        intensities <- as.vector(intensities)
+                      }
+                    }
+                    all_intensities[[i]] <- intensities
+                  }
+                  
+                  # Combine intensities based on display mode or superposition
+                  if (input$superpose && length(all_intensities) > 1) {
+                    # Average intensities for superposed ions
+                    pixel_values <- Reduce("+", all_intensities) / length(all_intensities)
+                  } else if (length(all_intensities) == 1) {
+                    pixel_values <- all_intensities[[1]]
+                  } else {
+                    pixel_values <- all_intensities[[1]] # Default to first ion if issues
+                  }
+                  
+                  # Remove NA and Inf values
+                  pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
+                  
+                  # Apply contrast enhancement if selected
+                  if (input$contrast3 == "histogram") {
+                    # Histogram equalization for better contrast
+                    n_breaks <- 100
+                    pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
+                  } else if (input$contrast3 == "adaptive") {
+                    # Simple adaptive contrast enhancement
+                    q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
+                    q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
+                    pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
+                    pixel_values[pixel_values < 0] <- 0
+                  }
+                  
+                  # Normalize values to color range
+                  if (any(pixel_values > 0)) {
+                    # Generate colormap with appropriate palette
+                    colormap <- cpal(input$color3)
+                    
+                    # Map intensities to colors, ensuring proper scaling
+                    nonzero_vals <- pixel_values[pixel_values > 0]
+                    if (length(nonzero_vals) > 0) {
+                      # Filter very low values (likely noise)
+                      intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
+                      pixel_values[pixel_values < intensity_threshold] <- 0
+                      
+                      # Scale values to colormap range
+                      scaled_values <- pixel_values
+                      if (max(scaled_values, na.rm = TRUE) > 0) {
+                        scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
+                                        (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
+                        scaled_values[scaled_values < 0] <- 0
+                        scaled_values[scaled_values > 1] <- 1
+                      }
+                      
+                      # Map to color indices
+                      color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
+                      color_indices[color_indices < 1 | is.na(color_indices)] <- 1
+                      image_colors <- colormap[color_indices]
+                      
+                      # Set transparent color for zero values
+                      image_colors[pixel_values == 0] <- NA
+                      
+                      # Render clean MSI image
+                      plot.new()
+                      plot.window(xlim = range(coords$x, na.rm = TRUE),
+                                ylim = range(coords$y, na.rm = TRUE))
+                      
+                      # Plot each pixel with appropriate color and size
+                      points(coords$x, coords$y, 
+                            pch = 15, 
+                            col = image_colors,
+                            cex = 1.5)  # Adjust pixel size as needed
+                      
+                      # Add axes and title
+                      box()
+                      if (length(mz_set) == 1) {
+                        title(main = paste("m/z", round(mz_set, 4)))
+                      } else if (length(mz_set) > 1) {
+                        title(main = paste("Multiple m/z values"))
+                      }
+                      
+                      if (input$colorkey3) {
+                        # Add color key with better legend formatting
+                        n_colors <- min(10, length(unique(image_colors)))
+                        legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
+                        legend("right", 
+                              legend = rep("", length(legend_colors)), 
+                              fill = legend_colors, 
+                              border = NA,
+                              bty = "n")
+                      }
+                      
+                      cat("Clean MSI rendering completed for custom ion\n")
+                    } else {
+                      cat("No non-zero intensity values found for selected m/z\n")
+                      # Fall back to standard rendering if no valid intensities
+                      print(do.call(Cardinal::image, arg_list))
+                    }
+                  } else {
+                    cat("No intensity values above zero for selected m/z\n")
+                    # Fall back to standard rendering if no valid intensities
+                    print(do.call(Cardinal::image, arg_list))
+                  }
+                }, error = function(e) {
+                  cat("Error in clean MSI rendering for custom ion:", e$message, "\n")
+                  # Fall back to standard rendering
+                  print(do.call(Cardinal::image, arg_list))
+                })
+              } else {
+                # Standard Cardinal image rendering
+                print(do.call(Cardinal::image, arg_list))
+              }
               
               vizi_par(vp_orig)
 
@@ -772,25 +1048,143 @@ plot_card_UI <- function(id) {
             }
           } else if (input$ion_viz3=="viz_first") {
             
-            
             tol=0.05
-            #browser()
-            image_command <-Cardinal::image(overview_peaks_sel, 
-                                  col=cpal(input$color3),
-                                  #enhance=input$contrast3,
-                                  #smooth=input$smooth3,
-                                  scale=input$normalize3,
-                                  #superpose=input$superpose,
-                                  key=(input$colorkey3),
-                                  #cex.axis=req(cex.axisp),
-                                  #cex.lab=cex.labp,
-                                  #cex.main=cex.mainp,
-                                  #cex.sub=cex.subp,
-                                  #mar=new_mar,
-                                  #mgp=new_mgp
-            )
             
-            print(image_command)
+            # Check for clean rendering mode
+              # Re-enable clean rendering mode
+              if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+                # Create clean MSI image with direct data extraction
+                tryCatch({
+                  # Get the first m/z value
+                  selected_mz <- mz(overview_peaks_sel)[1]
+                  cat("Using first m/z value:", selected_mz, "\n")
+                  
+                  # Extract grid coordinates directly
+                  coords <- coord(overview_peaks_sel)
+                  
+                  # Apply preprocessing for cleaner visualization
+                  msset_clean <- overview_peaks_sel
+                  if (input$smooth3 != "none") {
+                    msset_clean <- tryCatch({
+                      Cardinal::smoothSignal(msset_clean, method = input$smooth3)
+                    }, error = function(e) {
+                      cat("Smoothing failed, using original data:", e$message, "\n")
+                      msset_clean
+                    })
+                  }
+                  
+                  # Extract intensity values for the selected m/z
+                  tol_value <- if(!is.null(input$plusminus_viz3)) input$plusminus_viz3 else 0.05
+                  
+                  # Subset features based on m/z tolerance
+                  sub_data <- Cardinal::subsetFeatures(msset_clean, 
+                                                      mz >= selected_mz - tol_value & 
+                                                      mz <= selected_mz + tol_value)
+                  
+                  # Extract intensities
+                  intensities <- Cardinal::intensity(sub_data)
+                  
+                  # If multiple features match, combine them
+                  if (nrow(sub_data) > 1) {
+                    pixel_values <- apply(intensities, 2, mean, na.rm = TRUE)
+                  } else {
+                    pixel_values <- as.vector(intensities)
+                  }
+                  
+                  # Remove NA and Inf values
+                  pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
+                  
+                  # Apply contrast enhancement if selected
+                  if (input$contrast3 == "histogram") {
+                    # Histogram equalization for better contrast
+                    pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
+                  } else if (input$contrast3 == "adaptive") {
+                    # Simple adaptive contrast enhancement
+                    q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
+                    q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
+                    pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
+                    pixel_values[pixel_values < 0] <- 0
+                  }
+                  
+                  # Filter low-intensity values (likely noise)
+                  nonzero_vals <- pixel_values[pixel_values > 0]
+                  if (length(nonzero_vals) > 0) {
+                    intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
+                    pixel_values[pixel_values < intensity_threshold] <- 0
+                    
+                    # Generate colormap with selected palette
+                    colormap <- cpal(input$color3)
+                    
+                    # Scale values to colormap range
+                    scaled_values <- pixel_values
+                    if (max(scaled_values, na.rm = TRUE) > 0) {
+                      scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
+                                       (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
+                      scaled_values[scaled_values < 0] <- 0
+                      scaled_values[scaled_values > 1] <- 1
+                    }
+                    
+                    # Map to color indices
+                    color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
+                    color_indices[color_indices < 1 | is.na(color_indices)] <- 1
+                    image_colors <- colormap[color_indices]
+                    
+                    # Set transparent color for zero values
+                    image_colors[pixel_values == 0] <- NA
+                    
+                    # Render clean MSI image
+                    plot.new()
+                    plot.window(xlim = range(coords$x, na.rm = TRUE),
+                               ylim = range(coords$y, na.rm = TRUE))
+                    
+                    # Plot each pixel with appropriate color and size
+                    points(coords$x, coords$y, 
+                          pch = 15, 
+                          col = image_colors,
+                          cex = 1.5)  # Adjust pixel size as needed
+                    
+                    # Add axes and title
+                    box()
+                    title(main = paste("m/z", round(selected_mz, 4)))
+                    
+                    if (input$colorkey3) {
+                      # Add color key with better legend formatting
+                      n_colors <- min(10, length(unique(na.omit(image_colors))))
+                      legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
+                      legend("right", 
+                             legend = rep("", length(legend_colors)), 
+                             fill = legend_colors, 
+                             border = NA,
+                             bty = "n")
+                    }
+                    
+                    cat("Clean MSI rendering completed\n")
+                  } else {
+                    cat("No non-zero intensity values found for selected m/z\n")
+                    # Fall back to standard rendering
+                    image_command <- Cardinal::image(overview_peaks_sel, 
+                                      col=cpal(input$color3),
+                                      scale=input$normalize3,
+                                      key=(input$colorkey3))
+                    print(image_command)
+                  }
+                }, error = function(e) {
+                  cat("Error in clean MSI rendering:", e$message, "\n")
+                  # Fall back to standard rendering
+                  image_command <- Cardinal::image(overview_peaks_sel, 
+                                      col=cpal(input$color3),
+                                      scale=input$normalize3,
+                                      key=(input$colorkey3))
+                  print(image_command)
+                })
+              } else {
+                # Standard Cardinal image rendering
+                image_command <- Cardinal::image(overview_peaks_sel, 
+                                    col=cpal(input$color3),
+                                    scale=input$normalize3,
+                                    key=(input$colorkey3))
+                print(image_command)
+              }
             
             vizi_par(vp_orig)
             
@@ -814,48 +1208,278 @@ plot_card_UI <- function(id) {
               
               cat("Applying histology overlay with alpha =", allInputs$alpha, "\n")
               
-              # Load histology image
-              histology_path <- allInputs$histology_upload$datapath
-              file_type <- tools::file_ext(histology_path)
-              histology_image <- switch(file_type,
-                                        "png" = png::readPNG(histology_path),
-                                        "jpg" = jpeg::readJPEG(histology_path),
-                                        "jpeg" = jpeg::readJPEG(histology_path),
-                                        stop("Unsupported file type"))
-              
-              histology_image <- ensure_3d(histology_image)
-              
-              # Always add alpha channel based on slider value
-              # Remove existing alpha channel if present
-              if (dim(histology_image)[3] == 4) {
-                histology_image <- histology_image[,,,1:3]
+              # Check if using sample data (helpful for testing)
+              is_sample_data <- FALSE
+              if (is.character(allInputs$histology_upload$name) && 
+                  grepl("sample", tolower(allInputs$histology_upload$name))) {
+                cat("Detected sample histology data in filename\n")
+                is_sample_data <- TRUE
+                
+                # For sample data, try loading from current directory as fallback
+                if (file.exists("sample_histology.png")) {
+                  cat("Found sample_histology.png in current directory, will try as fallback if needed\n")
+                }
               }
               
-              # Add new alpha channel based on slider
-              alpha_channel <- array(allInputs$alpha, 
+              # Load histology image with improved file type detection
+              histology_path <- allInputs$histology_upload$datapath
+              
+              # More robust file type detection
+              file_type <- tolower(tools::file_ext(histology_path))
+              cat("Histology file type detected:", file_type, "\n")
+              
+              # Check if file exists and is readable
+              if (!file.exists(histology_path)) {
+                if (!is.null(allInputs$is_sample_data) && allInputs$is_sample_data && file.exists("sample_histology.png")) {
+                  cat("Using sample_histology.png as fallback\n")
+                  histology_path <- "sample_histology.png"
+                  file_type <- "png"
+                } else {
+                  stop(paste("Histology file not found:", histology_path))
+                }
+              }
+              
+              # Better error handling for image loading
+              tryCatch({
+                if (file_type %in% c("png")) {
+                  histology_image <- png::readPNG(histology_path)
+                  cat("Loaded PNG image, dimensions:", paste(dim(histology_image), collapse="×"), "\n")
+                } else if (file_type %in% c("jpg", "jpeg")) {
+                  histology_image <- jpeg::readJPEG(histology_path)
+                  cat("Loaded JPEG image, dimensions:", paste(dim(histology_image), collapse="×"), "\n")
+                } else {
+                  # Try to guess based on file content
+                  cat("Attempting to determine file type from content...\n")
+                  # Try PNG first
+                  histology_image <- tryCatch(
+                    png::readPNG(histology_path),
+                    error = function(e) {
+                      # If PNG fails, try JPEG
+                      tryCatch(
+                        jpeg::readJPEG(histology_path),
+                        error = function(e2) {
+                          stop(paste("Unsupported file type or corrupted image file:", file_type))
+                        }
+                      )
+                    }
+                  )
+                  cat("Successfully loaded image by content inspection\n")
+                }
+              }, error = function(e) {
+                stop(paste("Error loading histology image:", e$message))
+              })
+              
+              # Fix dimensions properly depending on array structure
+              if (length(dim(histology_image)) == 2) {
+                # Grayscale image - convert to RGB
+                histology_image <- array(rep(histology_image, 3), 
+                                        dim = c(dim(histology_image), 3))
+              } else if (length(dim(histology_image)) == 3) {
+                if (dim(histology_image)[3] == 4) {
+                  # Already has alpha channel - strip it
+                  histology_image <- histology_image[,,1:3]
+                } else if (dim(histology_image)[3] != 3) {
+                  # Weird number of channels - force to RGB
+                  histology_image <- histology_image[,,1:min(3, dim(histology_image)[3])]
+                  # If less than 3 channels, duplicate the last one
+                  if (dim(histology_image)[3] < 3) {
+                    last_channel <- histology_image[,,dim(histology_image)[3]]
+                    for (i in (dim(histology_image)[3]+1):3) {
+                      histology_image <- abind::abind(histology_image, last_channel, along=3)
+                    }
+                  }
+                }
+              } else if (length(dim(histology_image)) > 3) {
+                # Too many dimensions - flatten to 3D
+                histology_image <- histology_image[,,,1]
+                if (length(dim(histology_image)) == 2) {
+                  histology_image <- array(rep(histology_image, 3), 
+                                         dim = c(dim(histology_image), 3))
+                }
+              }
+              
+              # Add alpha channel with user-defined transparency
+              alpha_value <- if (!is.null(allInputs$alpha) && is.numeric(allInputs$alpha)) {
+                allInputs$alpha
+              } else {
+                0.7  # Use a different default than 0.5 to show it's not hardcoded
+              }
+              cat("Using alpha transparency value:", alpha_value, "\n")
+              
+              alpha_channel <- array(alpha_value, 
                                      dim = c(dim(histology_image)[1], 
                                              dim(histology_image)[2]))
               histology_image <- abind::abind(histology_image, alpha_channel, along = 3)
               
-              # Create and apply histology grob
+              # Get base scale factors from UI sliders
+              scalex <- allInputs$scalex
+              scaley <- allInputs$scaley
+              
+              # Log current resolution and dimension values for debugging
+              cat("Current resolution and dimension values in plot function:\n")
+              cat(" - Histology μm/pixel:", 
+                  if(!is.null(allInputs$histology_microns_per_pixel)) allInputs$histology_microns_per_pixel else "NULL", "\n")
+              cat(" - MSI μm/pixel:", 
+                  if(!is.null(allInputs$msi_microns_per_pixel)) allInputs$msi_microns_per_pixel else "NULL", "\n")
+              cat(" - Histology dimensions (px):", 
+                  if(!is.null(allInputs$histology_pixel_width)) allInputs$histology_pixel_width else "NULL", "×", 
+                  if(!is.null(allInputs$histology_pixel_height)) allInputs$histology_pixel_height else "NULL", "\n")
+              cat(" - MSI dimensions (px):", 
+                  if(!is.null(allInputs$msi_pixel_width)) allInputs$msi_pixel_width else "NULL", "×", 
+                  if(!is.null(allInputs$msi_pixel_height)) allInputs$msi_pixel_height else "NULL", "\n")
+              cat(" - Auto-scale enabled:", 
+                  if(!is.null(allInputs$auto_scale_resolution)) allInputs$auto_scale_resolution else "NULL", "\n")
+              cat(" - Scale target:", 
+                  if(!is.null(allInputs$scale_target)) allInputs$scale_target else "NULL", "\n")
+              
+              # Calculate combined scaling based on both pixel dimensions and resolution
+              pixel_dimension_scale_x <- 1
+              pixel_dimension_scale_y <- 1
+              
+              # Only apply pixel dimension scaling if all values are available
+              if (!is.null(allInputs$histology_pixel_width) && !is.null(allInputs$msi_pixel_width) &&
+                  !is.null(allInputs$histology_pixel_height) && !is.null(allInputs$msi_pixel_height) &&
+                  !is.na(allInputs$histology_pixel_width) && !is.na(allInputs$msi_pixel_width) && 
+                  !is.na(allInputs$histology_pixel_height) && !is.na(allInputs$msi_pixel_height) && 
+                  allInputs$histology_pixel_width > 0 && allInputs$msi_pixel_width > 0 &&
+                  allInputs$histology_pixel_height > 0 && allInputs$msi_pixel_height > 0) {
+                  
+                  # Calculate pixel dimension ratios
+                  pixel_dimension_scale_x <- allInputs$histology_pixel_width / allInputs$msi_pixel_width
+                  pixel_dimension_scale_y <- allInputs$histology_pixel_height / allInputs$msi_pixel_height
+                  
+                  cat("Pixel dimension scale factors - X:", pixel_dimension_scale_x, "Y:", pixel_dimension_scale_y, "\n")
+              } else {
+                  cat("Pixel dimension scaling not applied (missing or invalid dimensions)\n")
+              }
+              
+              # Apply resolution-based scaling if enabled
+              if (!is.null(allInputs$auto_scale_resolution) && allInputs$auto_scale_resolution && 
+                  !is.null(allInputs$histology_microns_per_pixel) && 
+                  !is.null(allInputs$msi_microns_per_pixel) && 
+                  !is.na(allInputs$histology_microns_per_pixel) && 
+                  !is.na(allInputs$msi_microns_per_pixel) && 
+                  allInputs$histology_microns_per_pixel > 0 && 
+                  allInputs$msi_microns_per_pixel > 0) {
+                
+                # Pick the target grid in µm/px based on selection
+                if (allInputs$scale_target == "msi") {
+                  target_um_per_px <- allInputs$msi_microns_per_pixel
+                } else if (allInputs$scale_target == "histology") {
+                  target_um_per_px <- allInputs$histology_microns_per_pixel
+                } else { 
+                  # "best_fit": geometric-mean grid is a sensible compromise
+                  target_um_per_px <- sqrt(allInputs$msi_microns_per_pixel * allInputs$histology_microns_per_pixel)
+                }
+                
+                # Calculate per-image scale factors (unitless, applied to pixel width/height)
+                scale_histology <- allInputs$histology_microns_per_pixel / target_um_per_px
+                scale_msi <- allInputs$msi_microns_per_pixel / target_um_per_px
+                
+                # For reference, calculate the old way too to log difference
+                resolution_ratio <- allInputs$msi_microns_per_pixel / allInputs$histology_microns_per_pixel
+                
+                cat("Target µm/pixel:", target_um_per_px, "\n")
+                cat("Resolution-based scale factors - Histology:", scale_histology, "MSI:", scale_msi, "\n")
+                cat("Resolution ratio (MSI:Histology):", resolution_ratio, "\n")
+                
+                # Combine resolution scaling with pixel dimension scaling
+                final_scale_x <- scalex * scale_histology * pixel_dimension_scale_x
+                final_scale_y <- scaley * scale_histology * pixel_dimension_scale_y
+                
+                cat("Final combined scale factors - X:", final_scale_x, "Y:", final_scale_y, "\n")
+                
+                # Apply appropriate scaling to histology image
+                scalex <- final_scale_x
+                scaley <- final_scale_y
+              } else {
+                # Even if auto-scale is disabled, still apply pixel dimension scaling
+                scalex <- scalex * pixel_dimension_scale_x
+                scaley <- scaley * pixel_dimension_scale_y
+                
+                cat("Applied pixel dimension scaling only (auto-scale disabled)\n")
+                cat("Final scale factors - X:", scalex, "Y:", scaley, "\n")
+              }
+              
+              # Safety check for very large images (prevent memory issues)
+              img_size <- prod(dim(histology_image)[1:2])
+              if (img_size > 5000000) { # 5 million pixels threshold
+                # Simple downsample for very large images
+                downsample_factor <- sqrt(5000000 / img_size)
+                new_dims <- round(dim(histology_image)[1:2] * downsample_factor)
+                
+                # Perform simple downsampling
+                rows <- round(seq(1, dim(histology_image)[1], length.out = new_dims[1]))
+                cols <- round(seq(1, dim(histology_image)[2], length.out = new_dims[2]))
+                
+                downsampled <- array(0, c(new_dims, dim(histology_image)[3]))
+                for (i in 1:dim(histology_image)[3]) {
+                  downsampled[,,i] <- histology_image[rows, cols, i]
+                }
+                histology_image <- downsampled
+                cat("Large image downsampled to:", paste(new_dims, collapse="x"), "pixels\n")
+              }
+              
+              # Ensure scale values are valid
+              scalex <- ifelse(is.finite(scalex) && scalex > 0, scalex, 1)
+              scaley <- ifelse(is.finite(scaley) && scaley > 0, scaley, 1)
+              
+              # Create and draw histology overlay
               histology_grob <- rasterGrob(histology_image, interpolate = TRUE)
               
+              # We'll use normalized coordinates (npc) with appropriate scaling
+              # This approach works reliably across different device sizes
+              width_value <- 1 * scalex
+              height_value <- 1 * scaley
+              
+              # Get the ratio between histology and MSI dimensions to inform scaling
+              # but we'll still use normalized coordinates for robustness
+              if (!is.null(allInputs$histology_pixel_width) && !is.null(allInputs$msi_pixel_width) &&
+                  !is.null(allInputs$histology_pixel_height) && !is.null(allInputs$msi_pixel_height) &&
+                  !is.na(allInputs$histology_pixel_width) && !is.na(allInputs$msi_pixel_width) && 
+                  !is.na(allInputs$histology_pixel_height) && !is.na(allInputs$msi_pixel_height) && 
+                  allInputs$histology_pixel_width > 0 && allInputs$msi_pixel_width > 0 &&
+                  allInputs$histology_pixel_height > 0 && allInputs$msi_pixel_height > 0) {
+                  
+                  # Log calculated dimensions
+                  cat("Using dimension ratios to inform scaling:\n")
+                  cat("Histology dimensions:", allInputs$histology_pixel_width, "×", allInputs$histology_pixel_height, "\n")
+                  cat("MSI dimensions:", allInputs$msi_pixel_width, "×", allInputs$msi_pixel_height, "\n")
+                  cat("Scaling applied - X:", scalex, "Y:", scaley, "\n")
+              }
+              
+              # Get the current device size to properly center the image
+              current_dev <- dev.cur()
+              dev_size <- dev.size("in")  # Get size in inches which is more reliable
+              dev_width <- dev_size[1]
+              dev_height <- dev_size[2]
+              
+              cat("Current device size:", dev_width, "×", dev_height, "inches\n")
+              
+              # Apply transformations to the grob using normalized coordinates (npc)
+              # This is the most reliable approach across different devices
               histology_grob <- editGrob(
                 histology_grob,
                 vp = viewport(
                   x = unit(0.5, "npc") + unit(allInputs$translate_x, "mm"),
                   y = unit(0.5, "npc") + unit(allInputs$translate_y, "mm"),
                   angle = allInputs$rotate,
-                  width = unit(1, "npc") * allInputs$scalex,
-                  height = unit(1, "npc") * allInputs$scaley,
+                  width = unit(width_value, "npc"),  # Normalized coordinates with scaling
+                  height = unit(height_value, "npc"), # Normalized coordinates with scaling
                   just = c("center", "center")
                 )
               )
               
-              # Draw the overlay on the current plot
+              # Draw the overlay with more detailed logging
+              cat("Drawing histology overlay with transform parameters:\n")
+              cat(" - Translation: X=", allInputs$translate_x, "mm, Y=", allInputs$translate_y, "mm\n")
+              cat(" - Rotation:", allInputs$rotate, "degrees\n")
+              cat(" - Scale: X=", scalex, ", Y=", scaley, "\n")
+              
               grid.draw(histology_grob)
               
             }, error = function(e) {
+              # Basic error handling
               cat("Error in histology overlay:", e$message, "\n")
             })
           }
