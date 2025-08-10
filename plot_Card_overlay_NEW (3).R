@@ -22,6 +22,8 @@ if (!require("abind", quietly = TRUE)) install.packages("abind")
 if (!require("tools", quietly = TRUE)) install.packages("tools")
 if (!require("png", quietly = TRUE)) install.packages("png")
 if (!require("jpeg", quietly = TRUE)) install.packages("jpeg")
+if (!requireNamespace("viridisLite", quietly=TRUE)) install.packages("viridisLite")
+if (!requireNamespace("pals", quietly=TRUE)) install.packages("pals")
 
 library(shiny)
 library(Cardinal)
@@ -38,29 +40,29 @@ cpal <- function(name) {
     switch(name,
       "Spectral" = rainbow(256),
       "Viridis" = {
-        if (requireNamespace("viridis", quietly = TRUE)) {
-          viridis::viridis(256)
+        if (requireNamespace("viridisLite", quietly = TRUE)) {
+          viridisLite::viridis(256)
         } else {
           rainbow(256)
         }
       },
       "Plasma" = {
-        if (requireNamespace("viridis", quietly = TRUE)) {
-          viridis::plasma(256)
+        if (requireNamespace("viridisLite", quietly = TRUE)) {
+          viridisLite::plasma(256)
         } else {
           heat.colors(256)
         }
       },
       "Inferno" = {
-        if (requireNamespace("viridis", quietly = TRUE)) {
-          viridis::inferno(256)
+        if (requireNamespace("viridisLite", quietly = TRUE)) {
+          viridisLite::inferno(256)
         } else {
           heat.colors(256)
         }
       },
       "Cividis" = {
-        if (requireNamespace("viridis", quietly = TRUE)) {
-          viridis::cividis(256)
+        if (requireNamespace("viridisLite", quietly = TRUE)) {
+          viridisLite::cividis(256)
         } else {
           rainbow(256)
         }
@@ -70,6 +72,130 @@ cpal <- function(name) {
     )
   }, error = function(e) {
     rainbow(256)  # Ultimate fallback
+  })
+}
+
+# features within ±ppm around each target
+features_in_ppm <- function(obj, targets, ppm){
+  mz_all <- mz(obj)
+  idxs <- unlist(lapply(targets, function(t){
+    tol <- t * ppm * 1e-6
+    which(mz_all >= t - tol & mz_all <= t + tol)
+  }))
+  unique(idxs)
+}
+
+# palette (no extra deps required; uses viridisLite if available)
+get_palette <- function(name){
+  if (name == "gray") return(grDevices::gray.colors(256))
+  if (requireNamespace("viridisLite", quietly = TRUE)) {
+    switch(name,
+      viridis = viridisLite::viridis(256),
+      plasma  = viridisLite::plasma(256),
+      magma   = viridisLite::magma(256),
+      inferno = viridisLite::inferno(256),
+      viridisLite::viridis(256)
+    )
+  } else grDevices::terrain.colors(256)
+}
+
+# clip + optional log + raster draw (keeps your Y flip)
+draw_clean_image_enhanced <- function(img, pal_name, clip_q = c(0.01, 0.99), log10_scale = FALSE){
+  z <- img$mat
+  if (log10_scale) z <- log10(pmax(z, 1))
+
+  nz <- as.numeric(z[is.finite(z) & z > 0])
+  if (length(nz)) {
+    q <- stats::quantile(nz, probs = pmin(pmax(clip_q, 0), 1), na.rm = TRUE)
+    z <- pmin(pmax(z, q[1]), q[2])
+    rng <- max(q[2] - q[1], .Machine$double.eps)
+    z <- (z - q[1]) / rng
+  } else {
+    z[] <- 0
+  }
+
+  op <- par(no.readonly = TRUE); on.exit(par(op))
+  par(mar = c(0,0,0,0), xaxs = "i", yaxs = "i", bg = "white")
+
+  graphics::image(
+    x = img$xs, y = img$ys, z = z,  # no transpose needed now
+    useRaster = TRUE, axes = FALSE, xlab = "", ylab = "",
+    ylim = rev(range(img$ys, na.rm = TRUE)),
+    col = get_palette(pal_name)
+  )
+}
+
+# Plotting parameters management function
+vizi_par <- function(...) {
+  if (length(list(...)) == 0) {
+    # Return current parameters
+    return(par(no.readonly = TRUE))
+  } else {
+    # Set parameters and return old values
+    return(par(...))
+  }
+}
+
+# Convert intensity vector to spatial image 
+vector_to_image <- function(values, coords) {
+  # Extract unique x and y coordinates
+  xs <- sort(unique(coords$x))
+  ys <- sort(unique(coords$y))
+  nx <- length(xs); ny <- length(ys)
+
+  # Create a matrix for the image - rows = x, cols = y
+  mat <- matrix(0, nrow = nx, ncol = ny)
+  
+  # Get indices for all points
+  x_idx <- match(coords$x, xs)  # 1..nx
+  y_idx <- match(coords$y, ys)  # 1..ny
+  
+  # Fill the matrix with intensity values
+  for (k in seq_along(values)) {
+    i <- x_idx[k]; j <- y_idx[k]
+    if (!is.na(i) && !is.na(j)) mat[i, j] <- values[k]
+  }
+  
+  return(list(mat = mat, xs = xs, ys = ys))
+}
+
+# Intensity vector for different visualization modes
+intensity_vector_for_mode <- function(obj, mode, mz_values = NULL, ppm = 10, norm = "None") {
+  I <- intensity(obj)           # features x pixels
+  coords <- coord(obj)
+
+  if (mode == "First Ion") {
+    vals <- as.numeric(I[1, ])
+  } else if (mode == "All Ions (TIC)") {
+    vals <- colSums(I, na.rm = TRUE)
+  } else { # Custom ions with ppm window(s)
+    idxs <- features_in_ppm(obj, mz_values, ppm)
+    if (length(idxs) == 0) {
+      vals <- rep(0, ncol(I))
+    } else {
+      vals <- colSums(I[idxs, , drop = FALSE], na.rm = TRUE)
+    }
+  }
+
+  # normalization
+  if (norm == "TIC") {
+    tic <- colSums(I, na.rm = TRUE); tic[tic == 0] <- 1
+    vals <- vals / tic
+  } else if (norm == "Max") {
+    m <- max(vals, na.rm = TRUE); if (is.finite(m) && m > 0) vals <- vals / m
+  }
+
+  vals[!is.finite(vals)] <- 0
+  list(vals = as.numeric(vals), coords = coords)
+}
+
+# Read MSI data with progress bar
+read_with_progress <- function(path) {
+  withProgress(message = "Reading MSI data…", value = 0, {
+    incProgress(0.2)
+    obj <- Cardinal::readMSIData(path)
+    incProgress(0.8)
+    obj
   })
 }
 
@@ -125,6 +251,12 @@ plot_card_UI <- function(id) {
                    column(12, sliderInput(ns("intensity_threshold"), "Noise threshold percentile", 
                                        min = 0, max = 0.2, value = 0.05, step = 0.01))
                  ),
+                 numericInput(ns("ppm"), "m/z tolerance (ppm):", 10, min = 1, step = 1),
+                 selectInput(ns("norm"), "Normalize:", c("None","TIC","Max"), selected = "None"),
+                 checkboxInput(ns("logScale"), "Log10 scale", value = FALSE),
+                 selectInput(ns("pal"), "Palette:", c("gray","viridis","plasma","magma","inferno"), "viridis"),
+                 sliderInput(ns("clip"), "Intensity clip (quantiles %):", 0, 100, value = c(1, 99)),
+                 checkboxInput(ns("smooth"), "Median smooth (fast)", value = FALSE),
                  checkboxInput(ns("plot_pdata"), "Plot Phenotype data?", value=FALSE),
                  uiOutput(ns("plotpdata")),
                  checkboxInput(ns("expand_fonts"), "Extended font options?", value=FALSE),
@@ -421,9 +553,9 @@ plot_card_UI <- function(id) {
           #req(overview_peaks_sel)
           
           # Add dependency on important parameters to trigger re-rendering
-          alpha_val <- allInputs$alpha
-          resolution_trigger <- allInputs$resolution_change_trigger
-          render_trigger <- allInputs$render_mode_change
+          alpha_val <- if (!is.null(allInputs) && !is.null(allInputs$alpha)) allInputs$alpha else 0.5
+          resolution_trigger <- if (!is.null(allInputs)) allInputs$resolution_change_trigger else NULL
+          render_trigger <- if (!is.null(allInputs)) allInputs$render_mode_change else NULL
           
           # A temp file to save the output.
           # This file will be removed later by renderImage
@@ -488,7 +620,7 @@ plot_card_UI <- function(id) {
             arg_list<-list(overview_peaks_sel, 
                        input$pdata_var_plot,
                         key=(input$colorkey3),
-                        col=pals::alphabet())
+                        col=if (requireNamespace("pals", quietly = TRUE)) pals::alphabet() else rainbow(26))
                         
             if(input$dark_bg) {
               arg_list$style <- "dark"
@@ -501,7 +633,7 @@ plot_card_UI <- function(id) {
             #                         input$pdata_var_plot,
             #                         key=(input$colorkey3),
             #                         #superpose=input$superpose,
-            #                         col=pals::alphabet())
+            #                         col=if (requireNamespace("pals", quietly = TRUE)) pals::alphabet() else rainbow(26))
             print(plt_tmp,
                                   #cex.axis=req(cex.axisp),
                                   #cex.lab=cex.labp,
@@ -579,17 +711,21 @@ plot_card_UI <- function(id) {
             }
             
             # Check if clean rendering mode is enabled for TIC visualization
-            if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+            if (!is.null(allInputs) && !is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
               # Create clean MSI image with direct data extraction for TIC
               tryCatch({
                 cat("Using clean rendering mode for TIC visualization\n")
                 
-                # Extract grid coordinates directly
-                coords <- coord(overview_peaks_sel)
-                
-                # Apply preprocessing for cleaner visualization
+                # Apply median smoothing if requested
                 msset_clean <- overview_peaks_sel
-                if (input$smooth3 != "none") {
+                if (isTRUE(input$smooth)) {
+                  msset_clean <- tryCatch({
+                    Cardinal::smoothSignal(msset_clean, method = "median")
+                  }, error = function(e) {
+                    cat("Smoothing failed, using original data:", e$message, "\n")
+                    msset_clean
+                  })
+                } else if (input$smooth3 != "none") {
                   msset_clean <- tryCatch({
                     Cardinal::smoothSignal(msset_clean, method = input$smooth3)
                   }, error = function(e) {
@@ -598,98 +734,55 @@ plot_card_UI <- function(id) {
                   })
                 }
                 
-                # For TIC, we want all features within the m/z range
-                tol_value <- round(plusminus, 3)
+                # Get intensity vector using our new function
+                iv <- tryCatch({
+                  intensity_vector_for_mode(
+                    msset_clean, 
+                    "All Ions (TIC)", 
+                    mz_values = NULL, 
+                    ppm = if(!is.null(input$ppm)) input$ppm else 10, 
+                    norm = if(!is.null(input$norm)) input$norm else "None"
+                  )
+                }, error = function(e) {
+                  cat("Error in intensity_vector_for_mode:", e$message, "\n")
+                  # Return default values to avoid errors
+                  coords <- coord(msset_clean)
+                  list(vals = rep(0, ncol(intensity(msset_clean))), coords = coords)
+                })
                 
-                # Subset features based on m/z range
-                sub_data <- Cardinal::subsetFeatures(msset_clean, 
-                                                    mz >= mz_set - tol_value & 
-                                                    mz <= mz_set + tol_value)
+                # Create image matrix
+                img_mat <- vector_to_image(iv$vals, iv$coords)
                 
-                # Calculate TIC for each pixel (sum of all intensities)
-                intensities <- Cardinal::intensity(sub_data)
-                pixel_values <- apply(intensities, 2, sum, na.rm = TRUE)
-                
-                # Remove NA and Inf values
-                pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
-                
-                # Apply contrast enhancement if selected
-                if (input$contrast3 == "histogram") {
-                  # Histogram equalization for better contrast
-                  pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
-                } else if (input$contrast3 == "adaptive") {
-                  # Simple adaptive contrast enhancement
-                  q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
-                  q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
-                  pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
-                  pixel_values[pixel_values < 0] <- 0
-                }
-                
-                # Filter low-intensity values (likely noise)
-                nonzero_vals <- pixel_values[pixel_values > 0]
-                if (length(nonzero_vals) > 0) {
-                  intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
-                  pixel_values[pixel_values < intensity_threshold] <- 0
-                  
-                  # Generate colormap with selected palette
-                  colormap <- cpal(input$color3)
-                  
-                  # Scale values to colormap range
-                  scaled_values <- pixel_values
-                  if (max(scaled_values, na.rm = TRUE) > 0) {
-                    scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
-                                     (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
-                    scaled_values[scaled_values < 0] <- 0
-                    scaled_values[scaled_values > 1] <- 1
-                  }
-                  
-                  # Map to color indices
-                  color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
-                  color_indices[color_indices < 1 | is.na(color_indices)] <- 1
-                  image_colors <- colormap[color_indices]
-                  
-                  # Set transparent color for zero values
-                  image_colors[pixel_values == 0] <- NA
-                  
-                  # Render clean MSI image
-                  plot.new()
-                  plot.window(xlim = range(coords$x, na.rm = TRUE),
-                             ylim = range(coords$y, na.rm = TRUE))
-                  
-                  # Adjust background color if needed
-                  if (input$dark_bg) {
-                    par(bg = "black")
-                  }
-                  
-                  # Plot each pixel with appropriate color and size
-                  points(coords$x, coords$y, 
-                        pch = 15, 
-                        col = image_colors,
-                        cex = 1.5)  # Adjust pixel size as needed
-                  
-                  # Add axes and title with appropriate style
-                  box()
-                  title_color <- if(input$dark_bg) "white" else "black"
-                  title(main = "Total Ion Current (TIC)", col.main = title_color)
-                  
-                  if (input$colorkey3) {
-                    # Add color key with better legend formatting
-                    n_colors <- min(10, length(unique(na.omit(image_colors))))
-                    legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
-                    legend("right", 
-                           legend = rep("", length(legend_colors)), 
-                           fill = legend_colors, 
-                           border = NA,
-                           bty = "n",
-                           text.col = title_color)
-                  }
-                  
-                  cat("Clean MSI rendering completed for TIC\n")
+                # Use the enhanced drawing function
+                q <- if(!is.null(input$clip)) {
+                  pmin(pmax(input$clip, 0), 100) / 100
                 } else {
-                  cat("No non-zero intensity values found for TIC\n")
-                  # Fall back to standard rendering
-                  print(do.call(Cardinal::image, arg_list))
+                  c(0.01, 0.99)  # Default if not set
                 }
+                
+                draw_clean_image_enhanced(
+                  img_mat,
+                  pal_name = if(!is.null(input$pal)) input$pal else "viridis",
+                  clip_q = c(min(q), max(q)),
+                  log10_scale = isTRUE(input$logScale)
+                )
+                
+                # Add title
+                title(main = "Total Ion Current (TIC)")
+                
+                if (input$colorkey3) {
+                  # Add color key
+                  pal_colors <- get_palette(if(!is.null(input$pal)) input$pal else "viridis")
+                  n_colors <- min(10, length(pal_colors))
+                  legend_colors <- pal_colors[seq(1, length(pal_colors), length.out = n_colors)]
+                  legend("right", 
+                         legend = rep("", length(legend_colors)), 
+                         fill = legend_colors, 
+                         border = NA,
+                         bty = "n")
+                }
+                
+                cat("Clean MSI rendering completed for TIC\n")
               }, error = function(e) {
                 cat("Error in clean MSI rendering for TIC:", e$message, "\n")
                 # Fall back to standard rendering
@@ -829,7 +922,11 @@ plot_card_UI <- function(id) {
                 arg_list$style <- "dark"
               }
               
-              print(matter::as_facets(do.call(Cardinal::image, arg_list), labels=label_txt))
+              if (requireNamespace("matter", quietly = TRUE)) {
+                print(matter::as_facets(do.call(Cardinal::image, arg_list), labels=label_txt))
+              } else {
+                print(do.call(Cardinal::image, arg_list))
+              }
               
               vizi_par(vp_orig)
 
@@ -887,20 +984,19 @@ plot_card_UI <- function(id) {
               }
               
               # Check for clean rendering mode for custom ion
-              if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+              if (!is.null(allInputs) && !is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
                 # Use direct data extraction approach for better pixel control
                 tryCatch({
-                  # Extract grid coordinates directly from MSI data
-                  coords <- coord(overview_peaks_sel)
-                  
-                  # Identify m/z indices for selected ions
-                  mz_indices <- sapply(mz_set, function(mz_value) {
-                    which.min(abs(mz(overview_peaks_sel) - mz_value))
-                  })
-                  
-                  # Apply preprocessing for cleaner visualization
+                  # Apply median smoothing if requested
                   msset_clean <- overview_peaks_sel
-                  if (input$smooth3 != "none") {
+                  if (isTRUE(input$smooth)) {
+                    msset_clean <- tryCatch({
+                      Cardinal::smoothSignal(msset_clean, method = "median")
+                    }, error = function(e) {
+                      cat("Smoothing failed, using original data:", e$message, "\n")
+                      msset_clean
+                    })
+                  } else if (input$smooth3 != "none") {
                     msset_clean <- tryCatch({
                       Cardinal::smoothSignal(msset_clean, method = input$smooth3)
                     }, error = function(e) {
@@ -909,129 +1005,59 @@ plot_card_UI <- function(id) {
                     })
                   }
                   
-                  # Extract intensity values for each selected m/z
-                  all_intensities <- list()
-                  for (i in seq_along(mz_indices)) {
-                    idx <- mz_indices[i]
-                    # Get intensities for this m/z value with tolerance
-                    mz_value <- mz(overview_peaks_sel)[idx]
-                    sub_data <- Cardinal::subsetFeatures(msset_clean, 
-                                                        mz >= mz_value - round(plusminus, 3) & 
-                                                        mz <= mz_value + round(plusminus, 3))
-                    
-                    if (input$superpose && i > 1) {
-                      # For superposition, combine with previous intensities
-                      intensities <- all_intensities[[1]]
-                    } else {
-                      # Extract raw intensities
-                      intensities <- Cardinal::intensity(sub_data)
-                      
-                      # If multiple features, combine according to display mode
-                      if (nrow(sub_data) > 1) {
-                        intensities <- apply(intensities, 2, mean, na.rm = TRUE)
-                      } else {
-                        intensities <- as.vector(intensities)
-                      }
-                    }
-                    all_intensities[[i]] <- intensities
-                  }
+                  # Get intensity vector using our new function
+                  iv <- tryCatch({
+                    intensity_vector_for_mode(
+                      msset_clean, 
+                      "Custom Ion(s)", 
+                      mz_values = mz_set, 
+                      ppm = if(!is.null(input$ppm)) input$ppm else 10, 
+                      norm = if(!is.null(input$norm)) input$norm else "None"
+                    )
+                  }, error = function(e) {
+                    cat("Error in intensity_vector_for_mode:", e$message, "\n")
+                    # Return default values to avoid errors
+                    coords <- coord(msset_clean)
+                    list(vals = rep(0, ncol(intensity(msset_clean))), coords = coords)
+                  })
                   
-                  # Combine intensities based on display mode or superposition
-                  if (input$superpose && length(all_intensities) > 1) {
-                    # Average intensities for superposed ions
-                    pixel_values <- Reduce("+", all_intensities) / length(all_intensities)
-                  } else if (length(all_intensities) == 1) {
-                    pixel_values <- all_intensities[[1]]
+                  # Create image matrix
+                  img_mat <- vector_to_image(iv$vals, iv$coords)
+                  
+                  # Use the enhanced drawing function
+                  q <- if(!is.null(input$clip)) {
+                    pmin(pmax(input$clip, 0), 100) / 100
                   } else {
-                    pixel_values <- all_intensities[[1]] # Default to first ion if issues
+                    c(0.01, 0.99)  # Default if not set
                   }
                   
-                  # Remove NA and Inf values
-                  pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
+                  draw_clean_image_enhanced(
+                    img_mat,
+                    pal_name = if(!is.null(input$pal)) input$pal else "viridis",
+                    clip_q = c(min(q), max(q)),
+                    log10_scale = isTRUE(input$logScale)
+                  )
                   
-                  # Apply contrast enhancement if selected
-                  if (input$contrast3 == "histogram") {
-                    # Histogram equalization for better contrast
-                    n_breaks <- 100
-                    pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
-                  } else if (input$contrast3 == "adaptive") {
-                    # Simple adaptive contrast enhancement
-                    q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
-                    q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
-                    pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
-                    pixel_values[pixel_values < 0] <- 0
+                  # Add title
+                  if (length(mz_set) == 1) {
+                    title(main = paste("m/z", round(mz_set, 4)))
+                  } else if (length(mz_set) > 1) {
+                    title(main = paste("Multiple m/z values"))
                   }
                   
-                  # Normalize values to color range
-                  if (any(pixel_values > 0)) {
-                    # Generate colormap with appropriate palette
-                    colormap <- cpal(input$color3)
-                    
-                    # Map intensities to colors, ensuring proper scaling
-                    nonzero_vals <- pixel_values[pixel_values > 0]
-                    if (length(nonzero_vals) > 0) {
-                      # Filter very low values (likely noise)
-                      intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
-                      pixel_values[pixel_values < intensity_threshold] <- 0
-                      
-                      # Scale values to colormap range
-                      scaled_values <- pixel_values
-                      if (max(scaled_values, na.rm = TRUE) > 0) {
-                        scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
-                                        (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
-                        scaled_values[scaled_values < 0] <- 0
-                        scaled_values[scaled_values > 1] <- 1
-                      }
-                      
-                      # Map to color indices
-                      color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
-                      color_indices[color_indices < 1 | is.na(color_indices)] <- 1
-                      image_colors <- colormap[color_indices]
-                      
-                      # Set transparent color for zero values
-                      image_colors[pixel_values == 0] <- NA
-                      
-                      # Render clean MSI image
-                      plot.new()
-                      plot.window(xlim = range(coords$x, na.rm = TRUE),
-                                ylim = range(coords$y, na.rm = TRUE))
-                      
-                      # Plot each pixel with appropriate color and size
-                      points(coords$x, coords$y, 
-                            pch = 15, 
-                            col = image_colors,
-                            cex = 1.5)  # Adjust pixel size as needed
-                      
-                      # Add axes and title
-                      box()
-                      if (length(mz_set) == 1) {
-                        title(main = paste("m/z", round(mz_set, 4)))
-                      } else if (length(mz_set) > 1) {
-                        title(main = paste("Multiple m/z values"))
-                      }
-                      
-                      if (input$colorkey3) {
-                        # Add color key with better legend formatting
-                        n_colors <- min(10, length(unique(image_colors)))
-                        legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
-                        legend("right", 
-                              legend = rep("", length(legend_colors)), 
-                              fill = legend_colors, 
-                              border = NA,
-                              bty = "n")
-                      }
-                      
-                      cat("Clean MSI rendering completed for custom ion\n")
-                    } else {
-                      cat("No non-zero intensity values found for selected m/z\n")
-                      # Fall back to standard rendering if no valid intensities
-                      print(do.call(Cardinal::image, arg_list))
-                    }
-                  } else {
-                    cat("No intensity values above zero for selected m/z\n")
-                    # Fall back to standard rendering if no valid intensities
-                    print(do.call(Cardinal::image, arg_list))
+                  if (input$colorkey3) {
+                    # Add color key
+                    pal_colors <- get_palette(if(!is.null(input$pal)) input$pal else "viridis")
+                    n_colors <- min(10, length(pal_colors))
+                    legend_colors <- pal_colors[seq(1, length(pal_colors), length.out = n_colors)]
+                    legend("right", 
+                           legend = rep("", length(legend_colors)), 
+                           fill = legend_colors, 
+                           border = NA,
+                           bty = "n")
                   }
+                  
+                  cat("Clean MSI rendering completed for custom ion\n")
                 }, error = function(e) {
                   cat("Error in clean MSI rendering for custom ion:", e$message, "\n")
                   # Fall back to standard rendering
@@ -1050,21 +1076,25 @@ plot_card_UI <- function(id) {
             
             tol=0.05
             
-            # Check for clean rendering mode
+              # Check for clean rendering mode
               # Re-enable clean rendering mode
-              if (!is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
+              if (!is.null(allInputs) && !is.null(allInputs$render_mode) && allInputs$render_mode == "clean") {
                 # Create clean MSI image with direct data extraction
                 tryCatch({
                   # Get the first m/z value
                   selected_mz <- mz(overview_peaks_sel)[1]
                   cat("Using first m/z value:", selected_mz, "\n")
                   
-                  # Extract grid coordinates directly
-                  coords <- coord(overview_peaks_sel)
-                  
-                  # Apply preprocessing for cleaner visualization
+                  # Apply median smoothing if requested
                   msset_clean <- overview_peaks_sel
-                  if (input$smooth3 != "none") {
+                  if (isTRUE(input$smooth)) {
+                    msset_clean <- tryCatch({
+                      Cardinal::smoothSignal(msset_clean, method = "median")
+                    }, error = function(e) {
+                      cat("Smoothing failed, using original data:", e$message, "\n")
+                      msset_clean
+                    })
+                  } else if (input$smooth3 != "none") {
                     msset_clean <- tryCatch({
                       Cardinal::smoothSignal(msset_clean, method = input$smooth3)
                     }, error = function(e) {
@@ -1073,101 +1103,55 @@ plot_card_UI <- function(id) {
                     })
                   }
                   
-                  # Extract intensity values for the selected m/z
-                  tol_value <- if(!is.null(input$plusminus_viz3)) input$plusminus_viz3 else 0.05
+                  # Get intensity vector using our new function
+                  iv <- tryCatch({
+                    intensity_vector_for_mode(
+                      msset_clean, 
+                      "First Ion", 
+                      mz_values = NULL, 
+                      ppm = if(!is.null(input$ppm)) input$ppm else 10, 
+                      norm = if(!is.null(input$norm)) input$norm else "None"
+                    )
+                  }, error = function(e) {
+                    cat("Error in intensity_vector_for_mode:", e$message, "\n")
+                    # Return default values to avoid errors
+                    coords <- coord(msset_clean)
+                    list(vals = rep(0, ncol(intensity(msset_clean))), coords = coords)
+                  })
                   
-                  # Subset features based on m/z tolerance
-                  sub_data <- Cardinal::subsetFeatures(msset_clean, 
-                                                      mz >= selected_mz - tol_value & 
-                                                      mz <= selected_mz + tol_value)
+                  # Create image matrix
+                  img_mat <- vector_to_image(iv$vals, iv$coords)
                   
-                  # Extract intensities
-                  intensities <- Cardinal::intensity(sub_data)
-                  
-                  # If multiple features match, combine them
-                  if (nrow(sub_data) > 1) {
-                    pixel_values <- apply(intensities, 2, mean, na.rm = TRUE)
+                  # Use the enhanced drawing function
+                  q <- if(!is.null(input$clip)) {
+                    pmin(pmax(input$clip, 0), 100) / 100
                   } else {
-                    pixel_values <- as.vector(intensities)
+                    c(0.01, 0.99)  # Default if not set
                   }
                   
-                  # Remove NA and Inf values
-                  pixel_values[is.na(pixel_values) | is.infinite(pixel_values)] <- 0
+                  draw_clean_image_enhanced(
+                    img_mat,
+                    pal_name = if(!is.null(input$pal)) input$pal else "viridis",
+                    clip_q = c(min(q), max(q)),
+                    log10_scale = isTRUE(input$logScale)
+                  )
                   
-                  # Apply contrast enhancement if selected
-                  if (input$contrast3 == "histogram") {
-                    # Histogram equalization for better contrast
-                    pixel_values <- rank(pixel_values) / length(pixel_values) * max(pixel_values, na.rm = TRUE)
-                  } else if (input$contrast3 == "adaptive") {
-                    # Simple adaptive contrast enhancement
-                    q_min <- quantile(pixel_values, 0.05, na.rm = TRUE)
-                    q_max <- quantile(pixel_values, 0.95, na.rm = TRUE)
-                    pixel_values <- (pixel_values - q_min) / (q_max - q_min) * max(pixel_values, na.rm = TRUE)
-                    pixel_values[pixel_values < 0] <- 0
+                  # Add title
+                  title(main = paste("m/z", round(selected_mz, 4)))
+                  
+                  if (input$colorkey3) {
+                    # Add color key
+                    pal_colors <- get_palette(if(!is.null(input$pal)) input$pal else "viridis")
+                    n_colors <- min(10, length(pal_colors))
+                    legend_colors <- pal_colors[seq(1, length(pal_colors), length.out = n_colors)]
+                    legend("right", 
+                           legend = rep("", length(legend_colors)), 
+                           fill = legend_colors, 
+                           border = NA,
+                           bty = "n")
                   }
                   
-                  # Filter low-intensity values (likely noise)
-                  nonzero_vals <- pixel_values[pixel_values > 0]
-                  if (length(nonzero_vals) > 0) {
-                    intensity_threshold <- quantile(nonzero_vals, input$intensity_threshold, na.rm = TRUE)
-                    pixel_values[pixel_values < intensity_threshold] <- 0
-                    
-                    # Generate colormap with selected palette
-                    colormap <- cpal(input$color3)
-                    
-                    # Scale values to colormap range
-                    scaled_values <- pixel_values
-                    if (max(scaled_values, na.rm = TRUE) > 0) {
-                      scaled_values <- (scaled_values - min(nonzero_vals, na.rm = TRUE)) / 
-                                       (max(scaled_values, na.rm = TRUE) - min(nonzero_vals, na.rm = TRUE))
-                      scaled_values[scaled_values < 0] <- 0
-                      scaled_values[scaled_values > 1] <- 1
-                    }
-                    
-                    # Map to color indices
-                    color_indices <- round(scaled_values * (length(colormap) - 1)) + 1
-                    color_indices[color_indices < 1 | is.na(color_indices)] <- 1
-                    image_colors <- colormap[color_indices]
-                    
-                    # Set transparent color for zero values
-                    image_colors[pixel_values == 0] <- NA
-                    
-                    # Render clean MSI image
-                    plot.new()
-                    plot.window(xlim = range(coords$x, na.rm = TRUE),
-                               ylim = range(coords$y, na.rm = TRUE))
-                    
-                    # Plot each pixel with appropriate color and size
-                    points(coords$x, coords$y, 
-                          pch = 15, 
-                          col = image_colors,
-                          cex = 1.5)  # Adjust pixel size as needed
-                    
-                    # Add axes and title
-                    box()
-                    title(main = paste("m/z", round(selected_mz, 4)))
-                    
-                    if (input$colorkey3) {
-                      # Add color key with better legend formatting
-                      n_colors <- min(10, length(unique(na.omit(image_colors))))
-                      legend_colors <- colormap[seq(1, length(colormap), length.out = n_colors)]
-                      legend("right", 
-                             legend = rep("", length(legend_colors)), 
-                             fill = legend_colors, 
-                             border = NA,
-                             bty = "n")
-                    }
-                    
-                    cat("Clean MSI rendering completed\n")
-                  } else {
-                    cat("No non-zero intensity values found for selected m/z\n")
-                    # Fall back to standard rendering
-                    image_command <- Cardinal::image(overview_peaks_sel, 
-                                      col=cpal(input$color3),
-                                      scale=input$normalize3,
-                                      key=(input$colorkey3))
-                    print(image_command)
-                  }
+                  cat("Clean MSI rendering completed\n")
                 }, error = function(e) {
                   cat("Error in clean MSI rendering:", e$message, "\n")
                   # Fall back to standard rendering
@@ -1184,9 +1168,8 @@ plot_card_UI <- function(id) {
                                     scale=input$normalize3,
                                     key=(input$colorkey3))
                 print(image_command)
-              }
-            
-            vizi_par(vp_orig)
+              }            
+              vizi_par(vp_orig)
             
           }
           
@@ -1206,7 +1189,8 @@ plot_card_UI <- function(id) {
                 return(image)
               }
               
-              cat("Applying histology overlay with alpha =", allInputs$alpha, "\n")
+              alpha_display <- if (!is.null(allInputs) && !is.null(allInputs$alpha)) allInputs$alpha else 0.5
+              cat("Applying histology overlay with alpha =", alpha_display, "\n")
               
               # Check if using sample data (helpful for testing)
               is_sample_data <- FALSE
@@ -1299,7 +1283,7 @@ plot_card_UI <- function(id) {
               }
               
               # Add alpha channel with user-defined transparency
-              alpha_value <- if (!is.null(allInputs$alpha) && is.numeric(allInputs$alpha)) {
+              alpha_value <- if (!is.null(allInputs) && !is.null(allInputs$alpha) && is.numeric(allInputs$alpha)) {
                 allInputs$alpha
               } else {
                 0.7  # Use a different default than 0.5 to show it's not hardcoded
@@ -1458,12 +1442,17 @@ plot_card_UI <- function(id) {
               
               # Apply transformations to the grob using normalized coordinates (npc)
               # This is the most reliable approach across different devices
+              # Get translation values with safe defaults
+              translate_x <- if (!is.null(allInputs) && !is.null(allInputs$translate_x)) allInputs$translate_x else 0
+              translate_y <- if (!is.null(allInputs) && !is.null(allInputs$translate_y)) allInputs$translate_y else 0
+              rotate_val <- if (!is.null(allInputs) && !is.null(allInputs$rotate)) allInputs$rotate else 0
+              
               histology_grob <- editGrob(
                 histology_grob,
                 vp = viewport(
-                  x = unit(0.5, "npc") + unit(allInputs$translate_x, "mm"),
-                  y = unit(0.5, "npc") + unit(allInputs$translate_y, "mm"),
-                  angle = allInputs$rotate,
+                  x = unit(0.5, "npc") + unit(translate_x, "mm"),
+                  y = unit(0.5, "npc") + unit(translate_y, "mm"),
+                  angle = rotate_val,
                   width = unit(width_value, "npc"),  # Normalized coordinates with scaling
                   height = unit(height_value, "npc"), # Normalized coordinates with scaling
                   just = c("center", "center")
@@ -1472,8 +1461,8 @@ plot_card_UI <- function(id) {
               
               # Draw the overlay with more detailed logging
               cat("Drawing histology overlay with transform parameters:\n")
-              cat(" - Translation: X=", allInputs$translate_x, "mm, Y=", allInputs$translate_y, "mm\n")
-              cat(" - Rotation:", allInputs$rotate, "degrees\n")
+              cat(" - Translation: X=", translate_x, "mm, Y=", translate_y, "mm\n")
+              cat(" - Rotation:", rotate_val, "degrees\n")
               cat(" - Scale: X=", scalex, ", Y=", scaley, "\n")
               
               grid.draw(histology_grob)
@@ -1630,7 +1619,7 @@ plot_card_UI <- function(id) {
                xlim=input$mass_range_plot
              }
              
-             vp_orig<-vizi_par()
+             vp_orig <- vizi_par()
              if(input$spectrum_expand_fonts) {
                req(input$spectrum_axis_size)
                
@@ -1746,8 +1735,8 @@ plot_card_UI <- function(id) {
              # Return a list containing the filename
              list(src = outfile,
                   contentType = 'image/png',
-                  width = input$width,
-                  height = input$height,
+                  width = input$width_ms,
+                  height = input$height_ms,
                   alt = "This is alternate text")
            }, deleteFile = TRUE)
            
