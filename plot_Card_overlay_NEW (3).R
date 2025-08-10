@@ -117,11 +117,16 @@ draw_clean_image_enhanced <- function(img, pal_name, clip_q = c(0.01, 0.99), log
   op <- par(no.readonly = TRUE); on.exit(par(op))
   par(mar = c(0,0,0,0), xaxs = "i", yaxs = "i", bg = "white")
 
+  # Calculate aspect ratio based on grid step sizes
+  dx <- if (length(img$xs) > 1) median(diff(img$xs)) else 1
+  dy <- if (length(img$ys) > 1) median(diff(img$ys)) else 1
+  
   graphics::image(
     x = img$xs, y = img$ys, z = z,  # no transpose needed now
     useRaster = TRUE, axes = FALSE, xlab = "", ylab = "",
     ylim = rev(range(img$ys, na.rm = TRUE)),
-    col = get_palette(pal_name)
+    col = get_palette(pal_name),
+    asp = (dy * length(img$ys)) / (dx * length(img$xs))  # preserve aspect ratio
   )
 }
 
@@ -150,10 +155,13 @@ vector_to_image <- function(values, coords) {
   x_idx <- match(coords$x, xs)  # 1..nx
   y_idx <- match(coords$y, ys)  # 1..ny
   
-  # Fill the matrix with intensity values
+  # Fill the matrix with intensity values - use max if multiple spectra map to same pixel
   for (k in seq_along(values)) {
     i <- x_idx[k]; j <- y_idx[k]
-    if (!is.na(i) && !is.na(j)) mat[i, j] <- values[k]
+    if (!is.na(i) && !is.na(j)) {
+      # Use max value when multiple spectra map to the same pixel
+      if (is.na(mat[i, j]) || values[k] > mat[i, j]) mat[i, j] <- values[k]
+    }
   }
   
   return(list(mat = mat, xs = xs, ys = ys))
@@ -163,6 +171,12 @@ vector_to_image <- function(values, coords) {
 intensity_vector_for_mode <- function(obj, mode, mz_values = NULL, ppm = 10, norm = "None") {
   I <- intensity(obj)           # features x pixels
   coords <- coord(obj)
+  
+  # Try to get physical pixel size from metadata (for reference/debugging)
+  um_per_px <- tryCatch(pixelSize(obj), error = function(e) NULL)
+  if (!is.null(um_per_px)) {
+    cat("Physical pixel size from imzML metadata:", um_per_px, "µm/px\n")
+  }
 
   if (mode == "First Ion") {
     vals <- as.numeric(I[1, ])
@@ -246,6 +260,13 @@ plot_card_UI <- function(id) {
                  fluidRow(
                    column(6, numericInput(ns("width_im"), "Image plot width (px)", value = 800, step = 50)),
                    column(6, numericInput(ns("height_im"), "Image plot height (px)", value=600, step = 50))
+                 ),
+                 fluidRow(
+                   column(12, checkboxInput(ns("use_1to1_export"), "Use 1:1 pixel export", value = FALSE),
+                          helpText("When enabled, exports at exact MSI pixel resolution"))
+                 ),
+                 fluidRow(
+                   column(12, verbatimTextOutput(ns("res_summary")))
                  ),
                  fluidRow(
                    column(12, sliderInput(ns("intensity_threshold"), "Noise threshold percentile", 
@@ -421,6 +442,36 @@ plot_card_UI <- function(id) {
         
       })
       
+      # Add MSI resolution and grid information summary
+      output$res_summary <- renderText({
+        req(overview_peaks_sel)
+        c <- coord(overview_peaks_sel)
+        xs <- sort(unique(c$x)); ys <- sort(unique(c$y))
+        nx <- length(xs); ny <- length(ys)
+        dx <- if (length(xs) > 1) median(diff(xs)) else NA
+        dy <- if (length(ys) > 1) median(diff(ys)) else NA
+        
+        # Try to get physical pixel size from metadata
+        um <- tryCatch(pixelSize(overview_peaks_sel), error = function(e) NULL)
+        
+        # If not in metadata, use the user-provided or default value
+        if (is.null(um)) {
+          um_str <- if (!is.null(allInputs) && !is.null(allInputs$msi_microns_per_pixel)) {
+            paste0(allInputs$msi_microns_per_pixel, " µm/px (user input)")
+          } else {
+            "unknown (not in imzML)"
+          }
+        } else {
+          um_str <- paste0(um, " µm/px (from imzML)")
+        }
+        
+        paste0(
+          "MSI grid (pixels): ", nx, " × ", ny, "\n",
+          "Grid step (coord units): dx=", round(dx,3), ", dy=", round(dy,3), "\n",
+          "Physical pixel size: ", um_str
+        )
+      })
+      
       observe({
         output$fonts <- renderUI ({
           
@@ -561,7 +612,18 @@ plot_card_UI <- function(id) {
           # This file will be removed later by renderImage
           outfile <- tempfile(fileext = '.png')
           
-          png(outfile, width = input$width_im, height = input$height_im)
+          # Use 1:1 pixel mapping if selected
+          if (isTRUE(input$use_1to1_export)) {
+            # Get exact MSI grid dimensions for 1:1 pixel mapping
+            coords <- coord(overview_peaks_sel)
+            nx <- length(unique(coords$x))
+            ny <- length(unique(coords$y))
+            cat("Using 1:1 pixel mapping for export: ", nx, "×", ny, " pixels\n")
+            png(outfile, width = nx, height = ny)
+          } else {
+            # Use user-specified dimensions
+            png(outfile, width = input$width_im, height = input$height_im)
+          }
           
           #ion <- switch(input$mode,
           #              "p"=786,
