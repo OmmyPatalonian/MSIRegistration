@@ -34,6 +34,9 @@ library(tools)
 library(png)
 library(jpeg)
 
+# Set option to use cairo for consistent rendering across platforms, especially on Mac
+options(shiny.usecairo = TRUE)
+
 # Color palette function - handles various color schemes
 cpal <- function(name) {
   tryCatch({
@@ -619,10 +622,10 @@ plot_card_UI <- function(id) {
             nx <- length(unique(coords$x))
             ny <- length(unique(coords$y))
             cat("Using 1:1 pixel mapping for export: ", nx, "×", ny, " pixels\n")
-            png(outfile, width = nx, height = ny)
+            png(outfile, width = nx, height = ny, units = "px", type = "cairo")
           } else {
             # Use user-specified dimensions
-            png(outfile, width = input$width_im, height = input$height_im)
+            png(outfile, width = input$width_im, height = input$height_im, units = "px", type = "cairo")
           }
           
           #ion <- switch(input$mode,
@@ -1470,68 +1473,131 @@ plot_card_UI <- function(id) {
               scalex <- ifelse(is.finite(scalex) && scalex > 0, scalex, 1)
               scaley <- ifelse(is.finite(scaley) && scaley > 0, scaley, 1)
               
-              # Create and draw histology overlay
-              histology_grob <- rasterGrob(histology_image, interpolate = TRUE)
+              # 1) Basic MSI grid info (native units = MSI pixel indices)
+              # Extract MSI grid coordinates for alignment in data units
+              xs <- NULL
+              ys <- NULL
               
-              # We'll use normalized coordinates (npc) with appropriate scaling
-              # This approach works reliably across different device sizes
-              width_value <- 1 * scalex
-              height_value <- 1 * scaley
-              
-              # Get the ratio between histology and MSI dimensions to inform scaling
-              # but we'll still use normalized coordinates for robustness
-              if (!is.null(allInputs$histology_pixel_width) && !is.null(allInputs$msi_pixel_width) &&
-                  !is.null(allInputs$histology_pixel_height) && !is.null(allInputs$msi_pixel_height) &&
-                  !is.na(allInputs$histology_pixel_width) && !is.na(allInputs$msi_pixel_width) && 
-                  !is.na(allInputs$histology_pixel_height) && !is.na(allInputs$msi_pixel_height) && 
-                  allInputs$histology_pixel_width > 0 && allInputs$msi_pixel_width > 0 &&
-                  allInputs$histology_pixel_height > 0 && allInputs$msi_pixel_height > 0) {
-                  
-                  # Log calculated dimensions
-                  cat("Using dimension ratios to inform scaling:\n")
-                  cat("Histology dimensions:", allInputs$histology_pixel_width, "×", allInputs$histology_pixel_height, "\n")
-                  cat("MSI dimensions:", allInputs$msi_pixel_width, "×", allInputs$msi_pixel_height, "\n")
-                  cat("Scaling applied - X:", scalex, "Y:", scaley, "\n")
+              # Try to get coordinates from overview_peaks_sel
+              if (exists("overview_peaks_sel") && !is.null(overview_peaks_sel)) {
+                tryCatch({
+                  coord_df <- coord(overview_peaks_sel)
+                  if (!is.null(coord_df)) {
+                    xs <- sort(unique(coord_df$x))
+                    ys <- sort(unique(coord_df$y))
+                    cat("Got MSI coordinates from overview_peaks_sel\n")
+                  }
+                }, error = function(e) {
+                  cat("Error getting coordinates from overview_peaks_sel:", e$message, "\n")
+                })
               }
               
-              # Get the current device size to properly center the image
-              current_dev <- dev.cur()
-              dev_size <- dev.size("in")  # Get size in inches which is more reliable
-              dev_width <- dev_size[1]
-              dev_height <- dev_size[2]
+              # Fallback if coordinates weren't found
+              if (is.null(xs) || is.null(ys) || length(xs) == 0 || length(ys) == 0) {
+                # Create default coordinates based on pixel dimensions if available
+                if (!is.null(allInputs$msi_pixel_width) && !is.null(allInputs$msi_pixel_height) &&
+                    !is.na(allInputs$msi_pixel_width) && !is.na(allInputs$msi_pixel_height) &&
+                    allInputs$msi_pixel_width > 0 && allInputs$msi_pixel_height > 0) {
+                  xs <- 1:allInputs$msi_pixel_width
+                  ys <- 1:allInputs$msi_pixel_height
+                  cat("Using default MSI grid coordinates from pixel dimensions\n")
+                } else {
+                  # Ultimate fallback
+                  xs <- 1:20  # Default assumption
+                  ys <- 1:20
+                  cat("Warning: Using fallback MSI grid coordinates\n")
+                }
+              }
               
-              cat("Current device size:", dev_width, "×", dev_height, "inches\n")
+              nx <- length(xs)
+              ny <- length(ys)
               
-              # Apply transformations to the grob using normalized coordinates (npc)
-              # This is the most reliable approach across different devices
+              # 2) Decide the goal: match pixel size (so pixel sizes equal across layers)
+              px_scale <- 1.0  # Default if resolution info missing
+              if (!is.null(allInputs$msi_microns_per_pixel) && !is.null(allInputs$histology_microns_per_pixel) &&
+                  !is.na(allInputs$msi_microns_per_pixel) && !is.na(allInputs$histology_microns_per_pixel) &&
+                  allInputs$msi_microns_per_pixel > 0 && allInputs$histology_microns_per_pixel > 0) {
+                px_scale <- allInputs$msi_microns_per_pixel / allInputs$histology_microns_per_pixel
+                cat("Resolution-based scale factor:", px_scale, "\n")
+                cat("(MSI:", allInputs$msi_microns_per_pixel, "µm/px ÷ Histology:", 
+                    allInputs$histology_microns_per_pixel, "µm/px)\n")
+              }
+              
+              # 3) Compute histology overlay size in MSI native pixels
+              # Histology physical size (µm)
+              hist_phys_w_um <- allInputs$histology_pixel_width * allInputs$histology_microns_per_pixel
+              hist_phys_h_um <- allInputs$histology_pixel_height * allInputs$histology_microns_per_pixel
+              # Convert to MSI pixels (native units)
+              hist_w_in_msi_px <- hist_phys_w_um / allInputs$msi_microns_per_pixel
+              hist_h_in_msi_px <- hist_phys_h_um / allInputs$msi_microns_per_pixel
+              
+              cat("Histology size in MSI pixels:", hist_w_in_msi_px, "×", hist_h_in_msi_px, "\n")
+              
+              # Apply user scaling factors
+              if (!is.null(scalex) && is.finite(scalex) && scalex > 0) {
+                hist_w_in_msi_px <- hist_w_in_msi_px * scalex
+              }
+              if (!is.null(scaley) && is.finite(scaley) && scaley > 0) {
+                hist_h_in_msi_px <- hist_h_in_msi_px * scaley
+              }
+              
+              # 4) Choose placement in MSI coordinates
               # Get translation values with safe defaults
-              translate_x <- if (!is.null(allInputs) && !is.null(allInputs$translate_x)) allInputs$translate_x else 0
-              translate_y <- if (!is.null(allInputs) && !is.null(allInputs$translate_y)) allInputs$translate_y else 0
+              tx <- if (!is.null(allInputs) && !is.null(allInputs$translate_x)) allInputs$translate_x else 0
+              ty <- if (!is.null(allInputs) && !is.null(allInputs$translate_y)) allInputs$translate_y else 0
               rotate_val <- if (!is.null(allInputs) && !is.null(allInputs$rotate)) allInputs$rotate else 0
               
-              histology_grob <- editGrob(
+              # Find center point in MSI coordinates
+              cx <- mean(range(xs)) + tx
+              cy <- mean(range(ys)) + ty
+              
+              # Convert center + size to corners in native (MSI) units
+              xleft   <- cx - hist_w_in_msi_px/2
+              xright  <- cx + hist_w_in_msi_px/2
+              ybottom <- cy - hist_h_in_msi_px/2
+              ytop    <- cy + hist_h_in_msi_px/2
+              
+              cat("Histology overlay position in MSI coordinates:\n")
+              cat(" - X range:", xleft, "to", xright, "\n")
+              cat(" - Y range:", ybottom, "to", ytop, "\n")
+              cat(" - Rotation:", rotate_val, "degrees\n")
+              
+              # 5) Draw in the SAME coordinate system as the MSI image
+              # Create the raster grob
+              histology_grob <- rasterGrob(histology_image, interpolate = TRUE)
+              
+              # Use a grid data viewport aligned to MSI coordinates
+              grid::pushViewport(grid::dataViewport(xscale = range(xs), yscale = range(ys), clip = "on"))
+              
+              # Apply transformations using native MSI units
+              histology_grob <- grid::editGrob(
                 histology_grob,
-                vp = viewport(
-                  x = unit(0.5, "npc") + unit(translate_x, "mm"),
-                  y = unit(0.5, "npc") + unit(translate_y, "mm"),
+                vp = grid::viewport(
+                  x = grid::unit((xleft + xright)/2, "native"),
+                  y = grid::unit((ybottom + ytop)/2, "native"),
+                  width = grid::unit((xright - xleft), "native"),
+                  height = grid::unit((ytop - ybottom), "native"),
                   angle = rotate_val,
-                  width = unit(width_value, "npc"),  # Normalized coordinates with scaling
-                  height = unit(height_value, "npc"), # Normalized coordinates with scaling
                   just = c("center", "center")
                 )
               )
               
               # Draw the overlay with more detailed logging
               cat("Drawing histology overlay with transform parameters:\n")
-              cat(" - Translation: X=", translate_x, "mm, Y=", translate_y, "mm\n")
+              cat(" - Translation: X=", tx, ", Y=", ty, "\n")
               cat(" - Rotation:", rotate_val, "degrees\n")
-              cat(" - Scale: X=", scalex, ", Y=", scaley, "\n")
+              cat(" - Scale factors: X=", scalex, ", Y=", scaley, "\n")
               
-              grid.draw(histology_grob)
+              grid::grid.draw(histology_grob)
+              
+              # Pop the viewport to restore state
+              grid::popViewport()
               
             }, error = function(e) {
               # Basic error handling
               cat("Error in histology overlay:", e$message, "\n")
+              # Make sure viewport is popped even in case of error
+              tryCatch(grid::popViewport(), error = function(e2) {})
             })
           }
           
@@ -1653,7 +1719,7 @@ plot_card_UI <- function(id) {
              # This file will be removed later by renderImage
              outfile <- tempfile(fileext = '.png')
              
-             png(outfile, width = input$width_ms, height = input$height_ms)
+             png(outfile, width = input$width_ms, height = input$height_ms, units = "px", type = "cairo")
              
             
              
